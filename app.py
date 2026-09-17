@@ -1,5 +1,7 @@
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from instagram.collector import InstagramCollectorError, StoryCollector
 from instagram.parser import normalize_username
@@ -7,11 +9,24 @@ from instagram.session import InstagramSessionError
 from rss.builder import build_story_rss
 
 
+BASE_DIR = Path(__file__).resolve().parent
+VIEWER_FILE = BASE_DIR / "static" / "index.html"
+
 app = FastAPI(
     title="Instagram Stories RSS",
     description="Converte exclusivamente Stories ativos do Instagram em JSON e Media RSS.",
-    version="0.1.0",
+    version="0.2.0",
 )
+
+
+@app.get("/", include_in_schema=False)
+def viewer() -> FileResponse:
+    return FileResponse(VIEWER_FILE)
+
+
+@app.get("/viewer", include_in_schema=False)
+def viewer_alias() -> FileResponse:
+    return FileResponse(VIEWER_FILE)
 
 
 @app.get("/health")
