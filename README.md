@@ -1,6 +1,6 @@
 # Instagram Stories RSS
 
-Microserviço focado exclusivamente em transformar **Stories ativos do Instagram** em JSON e Media RSS.
+Microserviço focado exclusivamente em transformar **Stories ativos do Instagram** em JSON, Media RSS e uma visualização web simples.
 
 > Este projeto não coleta posts, feed, hashtags ou Reels. Ele usa uma sessão autenticada do Instagram via Instaloader e foi pensado inicialmente para testes/protótipos. O Instagram pode alterar endpoints, exigir desafios de login ou aplicar rate limits.
 
@@ -13,13 +13,31 @@ Instaloader + sessão autenticada
       ↓
 Stories ativos
       ↓
-JSON / Media RSS
+JSON / Media RSS / Viewer web
       ↓
-NeoNews ou outro leitor RSS
+NeoNews, navegador ou outro leitor RSS
 ```
+
+## Viewer visual
+
+Depois de iniciar o servidor, abra:
+
+```text
+http://localhost:8000/
+```
+
+ou:
+
+```text
+http://localhost:8000/viewer
+```
+
+A interface permite digitar `@usuario`, `usuario` ou a URL do perfil. Os Stories ativos aparecem em um quadrado e avançam automaticamente. Imagens ficam 6 segundos na tela e vídeos avançam ao terminar. Também é possível navegar clicando nos lados esquerdo/direito do quadrado ou usando as setas do teclado.
 
 ## Endpoints
 
+- `GET /`
+- `GET /viewer`
 - `GET /health`
 - `GET /stories/{username}`
 - `GET /stories?profile=https://instagram.com/usuario`
@@ -71,7 +89,7 @@ cp .env.example .env
 uvicorn app:app --reload
 ```
 
-A API ficará em `http://localhost:8000`.
+A aplicação ficará em `http://localhost:8000`.
 
 ## Docker
 
@@ -102,11 +120,11 @@ docker run --rm -p 8000:8000 --env-file .env -v "$(pwd)/session:/app/session" in
 
 Cada Story vira um `<item>` com `guid`, `pubDate` e `media:content`. Imagens usam `image/jpeg`; vídeos usam `video/mp4`.
 
-Nesta primeira versão o RSS aponta para a URL de mídia entregue pelo Instagram. Essas URLs podem expirar. Uma evolução natural é adicionar cache/proxy de mídia próprio antes de usar isso em produção.
+Nesta primeira versão o RSS e o viewer apontam para a URL de mídia entregue pelo Instagram. Essas URLs podem expirar. Uma evolução natural é adicionar cache/proxy de mídia próprio antes de usar isso em produção.
 
 ## Testes
 
 ```bash
 pip install -r requirements-dev.txt
-pytest
+python -m pytest
 ```
