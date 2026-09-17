@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Instagram Stories Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #08090c;
+      color: #f7f7f8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 20% 15%, rgba(225, 48, 108, .16), transparent 30%),
+        radial-gradient(circle at 80% 20%, rgba(131, 58, 180, .18), transparent 32%),
+        #08090c;
+    }
+
+    button, input { font: inherit; }
+
+    .page {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 64px;
+    }
+
+    .hero {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid rgba(255,255,255,.11);
+      border-radius: 999px;
+      color: #c8c9d1;
+      font-size: 13px;
+      background: rgba(255,255,255,.04);
+    }
+
+    h1 {
+      margin: 14px 0 8px;
+      font-size: clamp(30px, 5vw, 50px);
+      letter-spacing: -.04em;
+    }
+
+    .subtitle {
+      margin: 0 auto;
+      max-width: 640px;
+      color: #a9abb5;
+      line-height: 1.6;
+    }
+
+    .search {
+      display: flex;
+      gap: 10px;
+      max-width: 720px;
+      margin: 28px auto 0;
+      padding: 8px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.1);
+      background: rgba(255,255,255,.055);
+      box-shadow: 0 18px 60px rgba(0,0,0,.28);
+      backdrop-filter: blur(14px);
+    }
+
+    .search input {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      color: #fff;
+      background: transparent;
+      padding: 13px 14px;
+    }
+
+    .search input::placeholder { color: #777a86; }
+
+    .search button {
+      border: 0;
+      border-radius: 13px;
+      padding: 12px 20px;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+      background: linear-gradient(135deg, #833ab4, #fd1d1d, #fcb045);
+      transition: transform .18s ease, filter .18s ease;
+    }
+
+    .search button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+    .search button:disabled { cursor: wait; opacity: .65; transform: none; }
+
+    .content {
+      display: grid;
+      place-items: center;
+      min-height: 600px;
+    }
+
+    .story-shell {
+      width: min(560px, 100%);
+    }
+
+    .viewer {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      overflow: hidden;
+      border-radius: 28px;
+      background: #111217;
+      border: 1px solid rgba(255,255,255,.10);
+      box-shadow: 0 30px 90px rgba(0,0,0,.48);
+    }
+
+    .media {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: #050505;
+    }
+
+    .media img,
+    .media video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: #050505;
+    }
+
+    .topbar {
+      position: absolute;
+      z-index: 5;
+      inset: 0 0 auto;
+      padding: 16px 16px 22px;
+      background: linear-gradient(to bottom, rgba(0,0,0,.72), transparent);
+    }
+
+    .progress {
+      display: flex;
+      gap: 5px;
+      margin-bottom: 14px;
+    }
+
+    .progress span {
+      flex: 1;
+      height: 3px;
+      border-radius: 99px;
+      overflow: hidden;
+      background: rgba(255,255,255,.28);
+    }
+
+    .progress i {
+      display: block;
+      width: 0;
+      height: 100%;
+      background: #fff;
+    }
+
+    .profile-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .profile {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .avatar {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+      font-size: 15px;
+      font-weight: 800;
+      background: linear-gradient(135deg, #833ab4, #fd1d1d, #fcb045);
+      box-shadow: 0 0 0 2px rgba(255,255,255,.78);
+    }
+
+    .profile-text { min-width: 0; }
+    .username { font-weight: 750; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .meta { margin-top: 2px; font-size: 12px; color: rgba(255,255,255,.68); }
+
+    .counter {
+      padding: 6px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(0,0,0,.42);
+      border: 1px solid rgba(255,255,255,.12);
+    }
+
+    .nav {
+      position: absolute;
+      inset: 0;
+      z-index: 4;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      pointer-events: none;
+    }
+
+    .nav button {
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+
+    .nav button:focus-visible { outline: 2px solid white; outline-offset: -4px; }
+
+    .empty,
+    .error,
+    .loading {
+      width: min(560px, 100%);
+      min-height: 330px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 40px;
+      border-radius: 28px;
+      border: 1px dashed rgba(255,255,255,.14);
+      background: rgba(255,255,255,.035);
+      color: #a9abb5;
+    }
+
+    .state-icon { font-size: 44px; margin-bottom: 14px; }
+    .state-title { color: #f5f5f7; font-weight: 800; font-size: 20px; margin-bottom: 7px; }
+    .state-copy { max-width: 390px; line-height: 1.55; }
+
+    .spinner {
+      width: 38px;
+      height: 38px;
+      margin: 0 auto 16px;
+      border-radius: 50%;
+      border: 3px solid rgba(255,255,255,.14);
+      border-top-color: #fff;
+      animation: spin .8s linear infinite;
+    }
+
+    .footer-note {
+      margin-top: 16px;
+      text-align: center;
+      color: #6f727d;
+      font-size: 12px;
+    }
+
+    [hidden] { display: none !important; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    @media (max-width: 640px) {
+      .page { width: min(100% - 20px, 1120px); padding-top: 26px; }
+      .search { flex-direction: column; border-radius: 16px; }
+      .search button { width: 100%; }
+      .viewer { border-radius: 22px; }
+      .content { min-height: 460px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="eyebrow">Instagram Stories · visualização ativa</div>
+      <h1>Veja os Stories pelo @</h1>
+      <p class="subtitle">Digite o usuário do Instagram. Os Stories ativos aparecem no quadrado abaixo e avançam automaticamente.</p>
+
+      <form id="searchForm" class="search">
+        <input id="profileInput" autocomplete="off" spellcheck="false" placeholder="@usuario ou instagram.com/usuario" aria-label="Usuário do Instagram">
+        <button id="searchButton" type="submit">Buscar Stories</button>
+      </form>
+    </section>
+
+    <section class="content" aria-live="polite">
+      <div id="emptyState" class="empty">
+        <div>
+          <div class="state-icon">◫</div>
+          <div class="state-title">Nenhum perfil carregado</div>
+          <div class="state-copy">Informe um @ acima para ver os Stories ativos da conta.</div>
+        </div>
+      </div>
+
+      <div id="loadingState" class="loading" hidden>
+        <div>
+          <div class="spinner"></div>
+          <div class="state-title">Buscando Stories…</div>
+          <div class="state-copy">Consultando o Instagram pela sessão configurada no servidor.</div>
+        </div>
+      </div>
+
+      <div id="errorState" class="error" hidden>
+        <div>
+          <div class="state-icon">!</div>
+          <div class="state-title" id="errorTitle">Não foi possível carregar</div>
+          <div class="state-copy" id="errorText"></div>
+        </div>
+      </div>
+
+      <div id="storyShell" class="story-shell" hidden>
+        <div class="viewer">
+          <div id="media" class="media"></div>
+
+          <div class="topbar">
+            <div id="progress" class="progress"></div>
+            <div class="profile-row">
+              <div class="profile">
+                <div id="avatar" class="avatar">@</div>
+                <div class="profile-text">
+                  <div id="username" class="username"></div>
+                  <div id="storyMeta" class="meta"></div>
+                </div>
+              </div>
+              <div id="counter" class="counter"></div>
+            </div>
+          </div>
+
+          <div class="nav" aria-label="Navegação dos Stories">
+            <button id="prevButton" type="button" aria-label="Story anterior"></button>
+            <button id="nextButton" type="button" aria-label="Próximo Story"></button>
+          </div>
+        </div>
+        <div class="footer-note">Clique no lado esquerdo ou direito do quadrado para navegar.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const IMAGE_DURATION = 6000;
+
+    const form = document.getElementById('searchForm');
+    const input = document.getElementById('profileInput');
+    const button = document.getElementById('searchButton');
+    const emptyState = document.getElementById('emptyState');
+    const loadingState = document.getElementById('loadingState');
+    const errorState = document.getElementById('errorState');
+    const errorTitle = document.getElementById('errorTitle');
+    const errorText = document.getElementById('errorText');
+    const storyShell = document.getElementById('storyShell');
+    const media = document.getElementById('media');
+    const progress = document.getElementById('progress');
+    const username = document.getElementById('username');
+    const avatar = document.getElementById('avatar');
+    const storyMeta = document.getElementById('storyMeta');
+    const counter = document.getElementById('counter');
+    const prevButton = document.getElementById('prevButton');
+    const nextButton = document.getElementById('nextButton');
+
+    let stories = [];
+    let currentIndex = 0;
+    let timer = null;
+    let animationFrame = null;
+    let startedAt = 0;
+
+    function showOnly(target) {
+      [emptyState, loadingState, errorState, storyShell].forEach(el => el.hidden = el !== target);
+    }
+
+    function clearTimers() {
+      if (timer) clearTimeout(timer);
+      if (animationFrame) cancelAnimationFrame(animationFrame);
+      timer = null;
+      animationFrame = null;
+    }
+
+    function formatRelativeTime(value) {
+      const date = new Date(value);
+      const diffMinutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60000));
+      if (diffMinutes < 1) return 'agora';
+      if (diffMinutes < 60) return `há ${diffMinutes} min`;
+      const hours = Math.floor(diffMinutes / 60);
+      return `há ${hours}h`;
+    }
+
+    function buildProgress() {
+      progress.innerHTML = stories.map((_, index) => `<span><i data-progress="${index}"></i></span>`).join('');
+    }
+
+    function paintProgress(ratio = 0) {
+      progress.querySelectorAll('i').forEach((bar, index) => {
+        if (index < currentIndex) bar.style.width = '100%';
+        else if (index > currentIndex) bar.style.width = '0%';
+        else bar.style.width = `${Math.min(100, Math.max(0, ratio * 100))}%`;
+      });
+    }
+
+    function animateImageProgress() {
+      const elapsed = Date.now() - startedAt;
+      const ratio = elapsed / IMAGE_DURATION;
+      paintProgress(ratio);
+      if (ratio < 1) animationFrame = requestAnimationFrame(animateImageProgress);
+    }
+
+    function goTo(index) {
+      if (!stories.length) return;
+      clearTimers();
+      currentIndex = (index + stories.length) % stories.length;
+      renderCurrentStory();
+    }
+
+    function next() { goTo(currentIndex + 1); }
+    function previous() { goTo(currentIndex - 1); }
+
+    function renderCurrentStory() {
+      const story = stories[currentIndex];
+      username.textContent = `@${story.username}`;
+      avatar.textContent = (story.username?.[0] || '@').toUpperCase();
+      storyMeta.textContent = `${formatRelativeTime(story.created_at)} · ${story.type === 'video' ? 'vídeo' : 'imagem'}`;
+      counter.textContent = `${currentIndex + 1} / ${stories.length}`;
+      media.innerHTML = '';
+      paintProgress(0);
+
+      if (story.type === 'video') {
+        const video = document.createElement('video');
+        video.src = story.media_url;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        video.controls = true;
+        video.preload = 'auto';
+        video.addEventListener('timeupdate', () => {
+          if (video.duration) paintProgress(video.currentTime / video.duration);
+        });
+        video.addEventListener('ended', next);
+        video.addEventListener('error', () => showPlaybackError('O vídeo deste Story não pôde ser carregado.'));
+        media.appendChild(video);
+        video.play().catch(() => {});
+        return;
+      }
+
+      const img = document.createElement('img');
+      img.src = story.media_url;
+      img.alt = `Story de @${story.username}`;
+      img.addEventListener('load', () => {
+        startedAt = Date.now();
+        animateImageProgress();
+        timer = setTimeout(next, IMAGE_DURATION);
+      });
+      img.addEventListener('error', () => showPlaybackError('A imagem deste Story não pôde ser carregada.'));
+      media.appendChild(img);
+    }
+
+    function showPlaybackError(message) {
+      clearTimers();
+      errorTitle.textContent = 'Mídia indisponível';
+      errorText.textContent = message;
+      showOnly(errorState);
+    }
+
+    async function loadStories(profile) {
+      clearTimers();
+      button.disabled = true;
+      button.textContent = 'Buscando…';
+      showOnly(loadingState);
+
+      try {
+        const response = await fetch(`/stories?profile=${encodeURIComponent(profile)}`, {
+          headers: { 'Accept': 'application/json' }
+        });
+
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.detail || `Erro ${response.status}`);
+
+        stories = Array.isArray(payload.stories) ? payload.stories : [];
+        currentIndex = 0;
+
+        if (!stories.length) {
+          errorTitle.textContent = `@${payload.username || profile} está sem Stories ativos`;
+          errorText.textContent = 'Nenhum Story disponível neste momento. Tente novamente mais tarde.';
+          showOnly(errorState);
+          return;
+        }
+
+        buildProgress();
+        showOnly(storyShell);
+        renderCurrentStory();
+      } catch (error) {
+        errorTitle.textContent = 'Não foi possível buscar os Stories';
+        errorText.textContent = error?.message || 'Erro inesperado ao consultar o perfil.';
+        showOnly(errorState);
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Buscar Stories';
+      }
+    }
+
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (!value) {
+        input.focus();
+        return;
+      }
+      loadStories(value);
+    });
+
+    prevButton.addEventListener('click', previous);
+    nextButton.addEventListener('click', next);
+
+    document.addEventListener('keydown', event => {
+      if (storyShell.hidden) return;
+      if (event.key === 'ArrowLeft') previous();
+      if (event.key === 'ArrowRight') next();
+    });
+  </script>
+</body>
+</html>
