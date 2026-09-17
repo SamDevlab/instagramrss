@@ -59,9 +59,24 @@ Copie `.env.example` para `.env`.
 INSTAGRAM_USERNAME=sua_conta_de_consulta
 INSTAGRAM_PASSWORD=
 INSTAGRAM_SESSION_FILE=./session/instagram.session
+INSTAGRAM_BROWSER_CHANNEL=chrome
 ```
 
-A opção recomendada é reutilizar uma sessão salva. Se o arquivo de sessão não existir e `INSTAGRAM_PASSWORD` estiver configurado, o serviço tenta fazer login uma vez e salva a sessão no caminho configurado.
+A aplicação reutiliza a sessão salva e captura Stories pela interface web do Instagram, sem usar o endpoint GraphQL do Instaloader durante o fluxo normal. Para criar a sessão inicial, preencha a senha temporariamente e execute:
+
+```powershell
+python scripts/create_instagram_session.py
+```
+
+O script cria `session/` automaticamente, trata 2FA quando solicitado pelo Instagram e salva a sessão no caminho configurado. Depois, a senha pode voltar a ficar vazia no `.env`.
+
+Se o Instagram bloquear o login automatizado mesmo após a verificação, use uma sessão já aberta no Chrome ou Edge:
+
+```powershell
+python scripts/create_instagram_session.py --browser chrome
+```
+
+Nesse caso, o navegador precisa estar autenticado na mesma conta indicada por `INSTAGRAM_USERNAME`. O navegador interno do Codex não é uma fonte suportada para importação de cookies.
 
 Nunca versione a sessão nem a senha.
 
@@ -76,7 +91,9 @@ Windows PowerShell:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 copy .env.example .env
+python scripts/create_instagram_session.py
 uvicorn app:app --reload
 ```
 
@@ -85,7 +102,9 @@ Linux/macOS:
 ```bash
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env
+python scripts/create_instagram_session.py
 uvicorn app:app --reload
 ```
 
