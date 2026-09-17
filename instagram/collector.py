@@ -170,6 +170,7 @@ class StoryCollector:
 
         stories: list[StoryMedia] = []
         seen_urls: set[str] = set()
+        seen_media_keys: set[str] = set()
         for _ in range(100):
             media_type, media_url = self._wait_for_media_url(
                 page,
@@ -177,17 +178,24 @@ class StoryCollector:
                 seen_urls,
                 media_response_sizes,
             )
-            if not media_url or media_url in seen_urls:
+            if not media_url:
                 break
 
             seen_urls.add(media_url)
+            media_key = self._media_key(media_type, media_url)
+            if media_key in seen_media_keys:
+                page.keyboard.press("ArrowRight")
+                page.wait_for_timeout(450)
+                continue
+
+            seen_media_keys.add(media_key)
             if media_type == "video":
                 page.wait_for_timeout(1_200)
                 assembled_media = self._assemble_media(media_url, media_assets)
                 if assembled_media:
                     register_media_content(media_url, assembled_media, "video/mp4")
             created_at = datetime.now(timezone.utc)
-            story_id = hashlib.sha256(media_url.encode("utf-8")).hexdigest()[:20]
+            story_id = hashlib.sha256(media_key.encode("utf-8")).hexdigest()[:20]
             stories.append(
                 StoryMedia(
                     id=story_id,
@@ -203,6 +211,12 @@ class StoryCollector:
             page.wait_for_timeout(450)
 
         return stories
+
+    @staticmethod
+    def _media_key(media_type: str, media_url: str) -> str:
+        if media_type == "video":
+            return urlsplit(media_url).path
+        return media_url
 
     @staticmethod
     def _wait_for_media_url(
