@@ -195,7 +195,7 @@ class StoryCollector:
                 assembled_media = self._assemble_media(media_url, media_assets)
                 if assembled_media:
                     register_media_content(media_url, assembled_media, "video/mp4")
-            created_at = datetime.now(timezone.utc)
+            created_at = self._current_story_created_at(page) or datetime.now(timezone.utc)
             story_id = hashlib.sha256(media_key.encode("utf-8")).hexdigest()[:20]
             stories.append(
                 StoryMedia(
@@ -212,6 +212,56 @@ class StoryCollector:
             page.wait_for_timeout(450)
 
         return stories
+
+    @staticmethod
+    def _current_story_created_at(page) -> datetime | None:
+        """Read the original publication time from Instagram's Story header."""
+        media_scope = StoryCollector._media_scope(page)
+        time_nodes = media_scope.locator("time[datetime]")
+        for index in range(time_nodes.count()):
+            node = time_nodes.nth(index)
+            try:
+                if not node.is_visible():
+                    continue
+                value = node.get_attribute("datetime")
+            except Exception:
+                continue
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+
+        # Older Instagram layouts may expose only text such as "21 h".
+        try:
+            text = media_scope.inner_text(timeout=1_000)
+        except Exception:
+            return None
+        match = re.search(
+            r"(?<!\w)(?:há\s*)?(\d+)\s*(seg(?:undo)?s?|s|min(?:uto)?s?|m|h(?:ora)?s?|"
+            r"d(?:ia)?s?|sem(?:ana)?s?|w(?:eeks?)?)(?!\w)",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit.startswith(("sem", "w")):
+            delta = timedelta(weeks=amount)
+        elif unit.startswith(("seg", "s")):
+            delta = timedelta(seconds=amount)
+        elif unit.startswith(("min", "m")):
+            delta = timedelta(minutes=amount)
+        elif unit.startswith(("h",)):
+            delta = timedelta(hours=amount)
+        elif unit.startswith(("d",)):
+            delta = timedelta(days=amount)
+        return datetime.now(timezone.utc) - delta
 
     @staticmethod
     def _media_key(media_type: str, media_url: str) -> str:
