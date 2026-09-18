@@ -176,6 +176,7 @@ class StoryCollector:
                 page,
                 media_requests,
                 seen_urls,
+                seen_media_keys,
                 media_response_sizes,
             )
             if not media_url:
@@ -223,14 +224,16 @@ class StoryCollector:
         page,
         media_requests: list[str],
         seen_urls: set[str],
+        seen_media_keys: set[str],
         media_response_sizes: dict[str, int],
     ) -> tuple[str, str | None]:
         media_type, media_url = "image", None
-        for _ in range(16):
+        for _ in range(24):
             media_type, media_url = StoryCollector._current_media(
                 page,
                 media_requests,
                 seen_urls,
+                seen_media_keys,
                 media_response_sizes,
             )
             if media_url:
@@ -259,21 +262,26 @@ class StoryCollector:
         page,
         media_requests: list[str] | None = None,
         seen_urls: set[str] | None = None,
+        seen_media_keys: set[str] | None = None,
         media_response_sizes: dict[str, int] | None = None,
     ) -> tuple[str, str | None]:
         media_scope = StoryCollector._media_scope(page)
+        seen = seen_urls or set()
+        seen_keys = seen_media_keys or set()
         videos = media_scope.locator("video")
         if videos.count():
             video = videos.last
             src = video.get_attribute("src") or video.get_attribute("data-src")
             if src and src.startswith("http"):
-                return "video", src
+                if StoryCollector._media_key("video", src) not in seen_keys:
+                    return "video", src
+                return "video", None
             if src and src.startswith("blob:"):
-                seen = seen_urls or set()
                 candidates = [
                     request_url
                     for request_url in media_requests or []
                     if request_url not in seen
+                    and StoryCollector._media_key("video", request_url) not in seen_keys
                 ]
                 sizes = media_response_sizes or {}
                 complete_candidates = [
@@ -296,7 +304,12 @@ class StoryCollector:
                 srcset = image.get_attribute("srcset") or ""
                 candidates = re.findall(r"(https?://[^\s,]+)", srcset)
                 src = candidates[-1] if candidates else None
-            if src and src.startswith("http") and not StoryCollector._is_profile_image(src):
+            if (
+                src
+                and src.startswith("http")
+                and src not in seen
+                and not StoryCollector._is_profile_image(src)
+            ):
                 return "image", src
 
         return "image", None
