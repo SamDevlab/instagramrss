@@ -21,5 +21,7 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      - name: Compile
+        run: python -m compileall -q .
       - name: Run tests
         run: python -m pytest -q
