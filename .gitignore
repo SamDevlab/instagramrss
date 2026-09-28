@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 session/
+data/
 *.session
 cookies/
 cookies.txt
@@ -23,3 +24,4 @@ credentials.yml
 *.secrets
 *.token
 cache/
+saveclip-protocol-report.json
