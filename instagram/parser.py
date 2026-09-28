@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 
@@ -9,6 +10,13 @@ _RESERVED_PATHS = {
     "reels",
     "stories",
 }
+
+
+@dataclass(frozen=True)
+class StoryPermalink:
+    username: str
+    seed_story_id: str
+    canonical_permalink: str
 
 
 def normalize_username(value: str) -> str:
@@ -37,3 +45,32 @@ def normalize_username(value: str) -> str:
         raise ValueError("Username do Instagram é muito longo")
 
     return username
+
+
+def parse_story_permalink(value: str) -> StoryPermalink:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("Link de Story não informado")
+
+    candidate = raw if "://" in raw else f"https://{raw}"
+    parsed = urlparse(candidate)
+
+    host = (parsed.hostname or "").lower()
+    if host not in {"instagram.com", "www.instagram.com"}:
+        raise ValueError("O link deve pertencer ao domínio instagram.com")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 3 or parts[0].lower() != "stories":
+        raise ValueError("Informe um link no formato /stories/usuario/ID/")
+
+    username = normalize_username(parts[1])
+    story_id = parts[2].strip()
+    if not story_id.isdigit():
+        raise ValueError("O ID do Story precisa ser numérico")
+
+    canonical = f"https://www.instagram.com/stories/{username}/{story_id}/"
+    return StoryPermalink(
+        username=username,
+        seed_story_id=story_id,
+        canonical_permalink=canonical,
+    )
