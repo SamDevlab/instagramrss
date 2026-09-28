@@ -88,15 +88,19 @@ def test_source_registration_refresh_and_legacy_aliases(monkeypatch, tmp_path):
                 },
             )
             source_id = created.json()["source_id"]
+            stories = await client.get(f"/sources/{source_id}/stories")
+            media_url = stories.json()["stories"][0]["media_url"]
             return (
                 created,
-                await client.get(f"/sources/{source_id}/stories"),
+                stories,
                 await client.get(f"/sources/{source_id}/rss.xml"),
                 await client.get("/stories/nasa"),
                 await client.get("/rss/stories/nasa"),
+                await client.get(media_url),
+                await client.get(media_url, headers={"Range": "bytes=0-3"}),
             )
 
-    created, stories, rss, legacy_stories, legacy_rss = asyncio.run(request_endpoints())
+    created, stories, rss, legacy_stories, legacy_rss, media, ranged = asyncio.run(request_endpoints())
 
     assert created.status_code == 200
     assert created.json()["username"] == "nasa"
@@ -112,3 +116,9 @@ def test_source_registration_refresh_and_legacy_aliases(monkeypatch, tmp_path):
         assert response.headers["content-type"].startswith("application/rss+xml")
         assert "instagram-story-123" in response.text
         assert "/media/" in response.text
+
+    assert media.status_code == 200
+    assert media.content == b"fake-image-bytes"
+    assert ranged.status_code in {200, 206}
+    if ranged.status_code == 206:
+        assert ranged.content == b"fake"
