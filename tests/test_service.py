@@ -2,6 +2,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 
 from instagram.providers.base import ProviderStory, ResolvedUser, StoryProvider
+from instagram.scheduler import StoryScheduler
 from instagram.service import SourceService
 from instagram.storage import SourceStore
 
@@ -125,3 +126,15 @@ def test_partial_download_preserves_previous_complete(tmp_path):
 
     assert result["status"] == "PARTIAL"
     assert after["snapshot_id"] == before["snapshot_id"]
+
+
+def test_scheduler_run_once_refreshes_registered_sources(tmp_path):
+    service, _ = make_service(tmp_path)
+    source = service.create_source("https://www.instagram.com/stories/nasa/999/")
+    scheduler = StoryScheduler(service, interval_minutes=15)
+
+    results = scheduler.run_once()
+
+    assert len(results) == 1
+    assert results[0]["source_id"] == source["source_id"]
+    assert results[0]["status"] == "COMPLETE"
