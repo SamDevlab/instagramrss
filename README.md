@@ -1,57 +1,91 @@
 # Instagram Stories RSS
 
-Microserviço focado exclusivamente em transformar **Stories ativos do Instagram** em JSON, Media RSS e uma visualização web simples.
+Microserviço FastAPI para cadastrar contas a partir do link de um Story ativo, consultar Stories diretamente com uma sessão persistente do Instagram, armazenar as mídias localmente e publicar JSON/Media RSS sem depender de URLs CDN temporárias.
 
-> Este projeto não coleta posts, feed, hashtags ou Reels. Ele usa uma sessão autenticada do Instagram via Instaloader e foi pensado inicialmente para testes/protótipos. O Instagram pode alterar endpoints, exigir desafios de login ou aplicar rate limits.
-
-## Fluxo
+## Arquitetura
 
 ```text
-URL ou @username
+permalink de Story
       ↓
-Instaloader + sessão autenticada
+username
       ↓
-Stories ativos
+Instagram user_id
       ↓
-JSON / Media RSS / Viewer web
+DirectInstagramProvider (sessão persistente)
       ↓
-NeoNews, navegador ou outro leitor RSS
+Stories ativas + IDs reais
+      ↓
+download local + SHA-256
+      ↓
+snapshot persistente
+      ↓
+JSON / Media RSS / Viewer
 ```
 
-## Viewer visual
+O SaveClip não faz parte do provider de produção. A ferramenta `saveclip_protocol_probe.py`, quando usada, serve somente para observação sanitizada durante a comparação de comportamento.
 
-Depois de iniciar o servidor, abra:
+## Cadastro
+
+A entrada principal é o link completo de um Story:
 
 ```text
-http://localhost:8000/
+https://www.instagram.com/stories/usuario/123456789/
 ```
 
-ou:
+O permalink serve para onboarding. Depois que o serviço resolve o `instagram_user_id`, os refreshes usam o ID persistido.
 
-```text
-http://localhost:8000/viewer
+Criar uma fonte:
+
+```bash
+curl -X POST http://localhost:8000/sources \
+  -H "Content-Type: application/json" \
+  -d '{"story_url":"https://www.instagram.com/stories/nasa/123456789/","refresh":true}'
 ```
-
-A interface permite digitar `@usuario`, `usuario` ou a URL do perfil. Os Stories ativos aparecem em um quadrado e avançam automaticamente. Imagens ficam 6 segundos na tela e vídeos avançam ao terminar. Também é possível navegar clicando nos lados esquerdo/direito do quadrado ou usando as setas do teclado.
 
 ## Endpoints
 
 - `GET /`
 - `GET /viewer`
 - `GET /health`
+- `POST /sources`
+- `GET /sources`
+- `GET /sources/{source_id}`
+- `POST /sources/{source_id}/refresh`
+- `GET /sources/{source_id}/stories`
+- `GET /sources/{source_id}/rss.xml`
+- `GET /media/{source_id}/{filename}`
+
+Aliases antigos continuam disponíveis para fontes já cadastradas:
+
 - `GET /stories/{username}`
-- `GET /stories?profile=https://instagram.com/usuario`
+- `GET /stories?profile=@usuario`
 - `GET /rss/stories/{username}`
-- `GET /rss/stories?profile=https://instagram.com/usuario`
+- `GET /rss/stories?profile=@usuario`
 
-Exemplo:
+Os aliases não fazem nova coleta. Eles leem o snapshot persistido.
 
-```bash
-curl http://localhost:8000/stories/nasa
-curl http://localhost:8000/rss/stories/nasa
+## Persistência
+
+Por padrão:
+
+```text
+data/
+  sources/
+    {source_id}/
+      source.json
+      state.json
+      current.json
+      catalog.json
+      media/
+        {sha256}.jpg
+        {sha256}.mp4
 ```
 
-## Configuração
+`provider_story_id` é a identidade lógica. SHA-256 é a identidade física do arquivo.
+
+Em falhas, o último snapshot `COMPLETE` é preservado. Um retorno vazio após um snapshot não vazio vira `SUSPICIOUS_EMPTY_SNAPSHOT`. Quedas maiores que 50% exigem confirmação em um segundo ciclo equivalente.
+
+## Sessão do Instagram
 
 Copie `.env.example` para `.env`.
 
@@ -59,26 +93,54 @@ Copie `.env.example` para `.env`.
 INSTAGRAM_USERNAME=sua_conta_de_consulta
 INSTAGRAM_PASSWORD=
 INSTAGRAM_SESSION_FILE=./session/instagram.session
-INSTAGRAM_BROWSER_CHANNEL=chrome
+INSTAGRAM_PROVIDER=direct
+
+DATA_DIR=./data
+PUBLIC_BASE_URL=http://localhost:8000
+STORY_REFRESH_MINUTES=15
+STORY_STALE_MINUTES=35
+STORY_SCHEDULER_ENABLED=true
 ```
 
-A aplicação reutiliza a sessão salva e captura Stories pela interface web do Instagram, sem usar o endpoint GraphQL do Instaloader durante o fluxo normal. Para criar a sessão inicial, preencha a senha temporariamente e execute:
+Para criar a sessão inicial, use temporariamente a senha e execute:
 
 ```powershell
 python scripts/create_instagram_session.py
 ```
 
-O script cria `session/` automaticamente, trata 2FA quando solicitado pelo Instagram e salva a sessão no caminho configurado. Depois, a senha pode voltar a ficar vazia no `.env`.
-
-Se o Instagram bloquear o login automatizado mesmo após a verificação, use uma sessão já aberta no Chrome ou Edge:
+Ou importe uma sessão de navegador já autenticado:
 
 ```powershell
 python scripts/create_instagram_session.py --browser chrome
 ```
 
-Nesse caso, o navegador precisa estar autenticado na mesma conta indicada por `INSTAGRAM_USERNAME`. O navegador interno do Codex não é uma fonte suportada para importação de cookies.
+Nunca versione senha, sessão, cookies ou dados do diretório `data/`.
 
-Nunca versione a sessão nem a senha.
+## Provider direto
+
+O provider padrão usa o Instaloader já presente no projeto:
+
+1. carrega a sessão persistente;
+2. resolve username para user ID numérico;
+3. consulta Stories atuais desse user ID;
+4. normaliza ID real, horário, tipo e URL temporária;
+5. a URL temporária é usada somente durante o download;
+6. RSS/JSON de produção usam URLs locais.
+
+Erros de rate limit, login, challenge, checkpoint e sessão inválida são convertidos em estados explícitos e não substituem o último snapshot válido.
+
+## Scheduler
+
+Com:
+
+```env
+STORY_SCHEDULER_ENABLED=true
+STORY_REFRESH_MINUTES=15
+```
+
+o processo percorre as fontes cadastradas. Há lock por fonte para impedir refresh simultâneo da mesma conta.
+
+`STORY_STALE_MINUTES` define quando uma fonte sem novo `COMPLETE` passa a `STALE`, sem apagar o snapshot.
 
 ## Rodando localmente
 
@@ -86,7 +148,7 @@ Nunca versione a sessão nem a senha.
 python -m venv .venv
 ```
 
-Windows PowerShell:
+Windows:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -108,42 +170,26 @@ python scripts/create_instagram_session.py
 uvicorn app:app --reload
 ```
 
-A aplicação ficará em `http://localhost:8000`.
-
 ## Docker
 
 ```bash
 docker build -t instagram-stories-rss .
-docker run --rm -p 8000:8000 --env-file .env -v "$(pwd)/session:/app/session" instagram-stories-rss
+docker run --rm -p 8000:8000 --env-file .env \
+  -v "$(pwd)/session:/app/session" \
+  -v "$(pwd)/data:/app/data" \
+  instagram-stories-rss
 ```
-
-## Exemplo JSON
-
-```json
-{
-  "username": "nasa",
-  "count": 2,
-  "stories": [
-    {
-      "id": "123456789",
-      "type": "image",
-      "media_url": "https://...",
-      "created_at": "2026-09-16T20:00:00+00:00",
-      "expires_at": "2026-09-17T20:00:00+00:00"
-    }
-  ]
-}
-```
-
-## Media RSS
-
-Cada Story vira um `<item>` com `guid`, `pubDate` e `media:content`. Imagens usam `image/jpeg`; vídeos usam `video/mp4`.
-
-Nesta primeira versão o RSS e o viewer apontam para a URL de mídia entregue pelo Instagram. Essas URLs podem expirar. Uma evolução natural é adicionar cache/proxy de mídia próprio antes de usar isso em produção.
 
 ## Testes
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest
+python -m pytest -q
+python -m compileall .
 ```
+
+Os testes automatizados usam providers/downloaders falsos e não dependem de Instagram, SaveClip, Chrome ou internet.
+
+## Limitações operacionais
+
+A interface não oficial do Instagram pode mudar e o Instagram pode aplicar rate limit ou exigir challenge. O serviço não tenta contornar esses mecanismos. Quando isso acontece, o estado anterior permanece publicado e o erro é registrado para diagnóstico.
