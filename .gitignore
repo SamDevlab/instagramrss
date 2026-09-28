@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 session/
 data/
+data-homologation*/
 *.session
 cookies/
 cookies.txt

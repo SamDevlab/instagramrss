@@ -8,12 +8,27 @@ from typing import Callable
 
 from instagram.downloader import MediaDownloadError, MediaDownloader
 from instagram.parser import parse_story_permalink
-from instagram.providers import DirectInstagramProvider, ProviderError, StoryProvider
+from instagram.providers import (
+    DirectInstagramProvider,
+    MobileInstagramProvider,
+    ProviderError,
+    ResolvedUser,
+    StoryProvider,
+)
 from instagram.storage import SourceStore, utcnow_iso
 
 
 class SourceServiceError(RuntimeError):
     pass
+
+
+def default_provider_factory() -> StoryProvider:
+    provider_name = os.getenv("INSTAGRAM_PROVIDER", "mobile").strip().lower() or "mobile"
+    if provider_name == "mobile":
+        return MobileInstagramProvider()
+    if provider_name == "direct":
+        return DirectInstagramProvider()
+    raise SourceServiceError(f"INSTAGRAM_PROVIDER inválido: {provider_name}")
 
 
 def _snapshot_id(items: list[dict]) -> str:
@@ -32,7 +47,7 @@ class SourceService:
         downloader: MediaDownloader | None = None,
     ) -> None:
         self.store = store or SourceStore()
-        self.provider_factory = provider_factory or DirectInstagramProvider
+        self.provider_factory = provider_factory or default_provider_factory
         self.downloader = downloader or MediaDownloader()
         self._locks: dict[str, Lock] = {}
         self._locks_guard = Lock()
@@ -62,7 +77,13 @@ class SourceService:
             }
 
         provider = self.provider_factory()
-        resolved = provider.resolve_user(parsed.username)
+        if source.get("instagram_user_id"):
+            resolved = ResolvedUser(
+                user_id=str(source["instagram_user_id"]),
+                username=str(source["username"]).lower(),
+            )
+        else:
+            resolved = provider.resolve_source(parsed.username, parsed.seed_story_id)
         source["username"] = resolved.username
         source["instagram_user_id"] = resolved.user_id
         source["updated_at"] = utcnow_iso()

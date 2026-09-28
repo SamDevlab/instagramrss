@@ -1,7 +1,7 @@
 import hashlib
 from datetime import datetime, timedelta, timezone
 
-from instagram.providers.base import ProviderStory, ResolvedUser, StoryProvider
+from instagram.providers.base import ProviderError, ProviderErrorCode, ProviderStory, ResolvedUser, StoryProvider
 from instagram.scheduler import StoryScheduler
 from instagram.service import SourceService
 from instagram.storage import SourceStore
@@ -138,3 +138,71 @@ def test_scheduler_run_once_refreshes_registered_sources(tmp_path):
     assert len(results) == 1
     assert results[0]["source_id"] == source["source_id"]
     assert results[0]["status"] == "COMPLETE"
+
+
+def test_provider_failure_preserves_previous_complete(tmp_path):
+    service, _ = make_service(tmp_path)
+    source = service.create_source("https://www.instagram.com/stories/nasa/999/")
+    service.refresh_source(source["source_id"])
+    before = service.current_snapshot(source["source_id"])
+
+    class FailingProvider(StoryProvider):
+        def resolve_user(self, username: str) -> ResolvedUser:
+            return ResolvedUser(user_id="42", username=username)
+
+        def list_stories(self, user_id: str, username: str) -> list[ProviderStory]:
+            raise ProviderError(ProviderErrorCode.PROVIDER_ERROR, "fixture failure")
+
+    service.provider_factory = FailingProvider
+    result = service.refresh_source(source["source_id"])
+
+    assert result["status"] == "PROVIDER_ERROR"
+    assert service.current_snapshot(source["source_id"])["snapshot_id"] == before["snapshot_id"]
+
+
+def test_large_drop_requires_confirmation(tmp_path):
+    service, _ = make_service(tmp_path)
+    MutableProvider.stories = [
+        make_story("a", 12),
+        make_story("b", 11),
+        make_story("c", 10),
+        make_story("d", 9),
+    ]
+    source = service.create_source("https://www.instagram.com/stories/nasa/999/")
+    service.refresh_source(source["source_id"])
+    before = service.current_snapshot(source["source_id"])
+
+    MutableProvider.stories = [make_story("a", 12)]
+    first = service.refresh_source(source["source_id"])
+    assert first["status"] == "SUSPICIOUS_LARGE_DROP"
+    assert service.current_snapshot(source["source_id"])["snapshot_id"] == before["snapshot_id"]
+
+    second = service.refresh_source(source["source_id"])
+    assert second["status"] == "COMPLETE"
+    assert [item["provider_story_id"] for item in service.current_snapshot(source["source_id"])["items"]] == ["a"]
+
+
+def test_scheduler_marks_old_source_stale(tmp_path):
+    service, _ = make_service(tmp_path)
+    source = service.create_source("https://www.instagram.com/stories/nasa/999/")
+    service.refresh_source(source["source_id"])
+    state = service.store.load_state(source["source_id"])
+    state["lastCompleteAt"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    service.store.save_state(source["source_id"], state)
+
+    service.mark_stale_sources(stale_minutes=35)
+
+    assert service.store.load_state(source["source_id"])["lastStatus"] == "STALE"
+
+
+def test_refresh_lock_returns_locked_without_overlapping_collection(tmp_path):
+    service, _ = make_service(tmp_path)
+    source = service.create_source("https://www.instagram.com/stories/nasa/999/")
+    lock = service._lock_for(source["source_id"])
+    assert lock.acquire(blocking=False)
+    try:
+        result = service.refresh_source(source["source_id"])
+    finally:
+        lock.release()
+
+    assert result["status"] == "LOCKED"

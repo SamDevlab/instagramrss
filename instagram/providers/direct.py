@@ -21,12 +21,7 @@ def _utc(value: datetime) -> datetime:
 
 
 class DirectInstagramProvider(StoryProvider):
-    """Direct Story provider backed by the persistent Instaloader session.
-
-    This provider does not use SaveClip/SaveInsta/SnapInsta. The permalink is
-    only used by onboarding; steady-state refreshes use the persisted numeric
-    Instagram user id.
-    """
+    """Story provider backed by the persistent Instaloader session."""
 
     def __init__(self) -> None:
         try:

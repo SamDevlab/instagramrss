@@ -53,6 +53,14 @@ class ProviderStory:
 
 
 class StoryProvider(ABC):
+    def resolve_source(self, username: str, seed_story_id: str | None = None) -> ResolvedUser:
+        """Resolve a source during onboarding.
+
+        Providers that can use a Story permalink may override this method. The
+        default keeps existing providers and test doubles compatible.
+        """
+        return self.resolve_user(username)
+
     @abstractmethod
     def resolve_user(self, username: str) -> ResolvedUser:
         raise NotImplementedError
