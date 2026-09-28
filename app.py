@@ -1,5 +1,6 @@
 import mimetypes
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -20,28 +21,37 @@ source_store = SourceStore()
 source_service = SourceService(store=source_store)
 story_scheduler = StoryScheduler(source_service)
 
+
+def _scheduler_enabled() -> bool:
+    return os.getenv("STORY_SCHEDULER_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if _scheduler_enabled():
+        story_scheduler.start()
+    try:
+        yield
+    finally:
+        story_scheduler.stop()
+
+
 app = FastAPI(
     title="Instagram Stories RSS",
     description="Stories ativos do Instagram com cache persistente e Media RSS local.",
     version="0.3.0",
+    lifespan=lifespan,
 )
 
 
 class SourceCreateRequest(BaseModel):
     story_url: str
     refresh: bool = False
-
-
-@app.on_event("startup")
-def _startup_scheduler() -> None:
-    enabled = os.getenv("STORY_SCHEDULER_ENABLED", "false").strip().lower()
-    if enabled in {"1", "true", "yes", "on"}:
-        story_scheduler.start()
-
-
-@app.on_event("shutdown")
-def _shutdown_scheduler() -> None:
-    story_scheduler.stop()
 
 
 @app.get("/", include_in_schema=False)
@@ -56,10 +66,9 @@ def viewer_alias() -> FileResponse:
 
 @app.get("/health")
 def health() -> dict:
-    enabled = os.getenv("STORY_SCHEDULER_ENABLED", "false").strip().lower()
     return {
         "status": "ok",
-        "scheduler_enabled": enabled in {"1", "true", "yes", "on"},
+        "scheduler_enabled": _scheduler_enabled(),
         "scheduler_running": story_scheduler.running,
     }
 
