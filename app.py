@@ -1,25 +1,62 @@
+import mimetypes
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 
-from instagram.collector import InstagramCollectorError, StoryCollector
-from instagram.media_proxy import register_media, resolve_media, resolve_media_content
+from instagram.auth.service import AuthConnectionError, AuthConnectionService
 from instagram.parser import normalize_username
-from instagram.session import InstagramSessionError
-from rss.builder import build_story_rss
+from instagram.scheduler import StoryScheduler
+from instagram.service import SourceService, SourceServiceError
+from instagram.storage import SourceStore
+from rss.builder import build_source_rss
 
 
 BASE_DIR = Path(__file__).resolve().parent
 VIEWER_FILE = BASE_DIR / "static" / "index.html"
 
+source_store = SourceStore()
+auth_connection_service = AuthConnectionService()
+source_service = SourceService(store=source_store, auth_service=auth_connection_service)
+story_scheduler = StoryScheduler(source_service)
+
+
+def _scheduler_enabled() -> bool:
+    return os.getenv("STORY_SCHEDULER_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if _scheduler_enabled():
+        story_scheduler.start()
+    try:
+        yield
+    finally:
+        story_scheduler.stop()
+
+
 app = FastAPI(
     title="Instagram Stories RSS",
-    description="Converte exclusivamente Stories ativos do Instagram em JSON e Media RSS.",
-    version="0.2.0",
+    description="Stories ativos do Instagram com cache persistente e Media RSS local.",
+    version="0.3.0",
+    lifespan=lifespan,
 )
+
+
+class SourceCreateRequest(BaseModel):
+    story_url: str
+    refresh: bool = False
+    auth_connection_id: str | None = None
+    owner_id: str | None = None
+    auth_policy: str | None = None
 
 
 @app.get("/", include_in_schema=False)
@@ -34,94 +71,198 @@ def viewer_alias() -> FileResponse:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "scheduler_enabled": _scheduler_enabled(),
+        "scheduler_running": story_scheduler.running,
+    }
 
 
-def _fetch_stories(profile: str):
+def _source_for_username(value: str) -> dict:
+    username = normalize_username(value)
+    source = source_store.find_source_by_username(username)
+    if not source:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Fonte @{username} ainda não cadastrada. "
+                "Cadastre com POST /sources usando o link de um Story ativo."
+            ),
+        )
+    return source
+
+
+def _snapshot_payload(source: dict) -> dict:
+    source_id = source["source_id"]
+    snapshot = source_service.current_snapshot(source_id)
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    stories = []
+    for item in snapshot.get("items") or []:
+        story = dict(item)
+        local_url = f"/media/{source_id}/{item['filename']}"
+        story["media_url"] = f"{base}{local_url}" if base else local_url
+        story["id"] = item["provider_story_id"]
+        story["type"] = item["media_type"]
+        story["created_at"] = item["taken_at"]
+        stories.append(story)
+    return {
+        "source_id": source_id,
+        "username": source["username"],
+        "status": snapshot.get("status", "EMPTY"),
+        "snapshot_id": snapshot.get("snapshot_id"),
+        "count": len(stories),
+        "stories": stories,
+    }
+
+
+@app.post("/sources")
+def create_source(payload: SourceCreateRequest) -> dict:
     try:
-        username = normalize_username(profile)
-        stories = StoryCollector().fetch(username)
-        return username, stories
+        return source_service.create_source(
+            payload.story_url,
+            refresh=payload.refresh,
+            auth_connection_id=payload.auth_connection_id,
+            owner_id=payload.owner_id,
+            auth_policy=payload.auth_policy,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except InstagramSessionError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except InstagramCollectorError as exc:
+    except AuthConnectionError as exc:
+        if exc.code in {"OWNER_ID_INVALID", "AUTH_CONNECTION_SCOPE_INVALID"}:
+            status_code = 400
+        elif exc.code in {
+            "AUTH_CONNECTION_REQUIRED",
+            "AUTH_CONNECTION_FORBIDDEN",
+            "AUTH_CONNECTION_CAPABILITY_MISMATCH",
+            "AUTH_POLICY_INVALID",
+            "RECONNECT_REQUIRED",
+            "REVOKED",
+        }:
+            status_code = 409
+        else:
+            status_code = 503
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except SourceServiceError as exc:
+        if exc.code in {
+            "AUTH_CONNECTION_REQUIRED",
+            "AUTH_CONNECTION_FORBIDDEN",
+            "AUTH_POLICY_INVALID",
+            "RECONNECT_REQUIRED",
+            "REVOKED",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-def _stories_payload(profile: str) -> dict:
-    username, stories = _fetch_stories(profile)
-    serialized_stories = []
-    for story in stories:
-        register_media(story.id, story.media_url)
-        story_data = story.to_dict()
-        story_data["media_url"] = f"/media/{story.id}"
-        serialized_stories.append(story_data)
+@app.get("/auth-connections")
+def list_auth_connections() -> dict:
     return {
-        "username": username,
-        "count": len(stories),
-        "stories": serialized_stories,
+        "count": len(auth_connection_service.list_public()),
+        "connections": auth_connection_service.list_public(),
     }
+
+
+@app.get("/auth-connections/{connection_id}")
+def get_auth_connection(connection_id: str) -> dict:
+    try:
+        return auth_connection_service.get(connection_id).public_dict()
+    except AuthConnectionError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.delete("/auth-connections/{connection_id}")
+def disconnect_auth_connection(connection_id: str) -> dict:
+    try:
+        return auth_connection_service.disconnect(connection_id).public_dict()
+    except AuthConnectionError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/sources")
+def list_sources() -> dict:
+    sources = source_service.list_sources()
+    return {"count": len(sources), "sources": sources}
+
+
+@app.get("/sources/{source_id}")
+def get_source(source_id: str) -> dict:
+    try:
+        return source_service.get_source(source_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/sources/{source_id}/refresh")
+def refresh_source(source_id: str) -> dict:
+    try:
+        return source_service.refresh_source(source_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/sources/{source_id}/stories")
+def source_stories(source_id: str) -> dict:
+    try:
+        source = source_store.load_source(source_id)
+        return _snapshot_payload(source)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/sources/{source_id}/rss.xml")
+def source_rss(source_id: str) -> Response:
+    try:
+        source = source_store.load_source(source_id)
+        snapshot = source_service.current_snapshot(source_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    xml = build_source_rss(source, snapshot, public_base_url=os.getenv("PUBLIC_BASE_URL", ""))
+    return Response(content=xml, media_type="application/rss+xml; charset=utf-8")
 
 
 @app.get("/stories")
 def stories_query(profile: str = Query(..., description="URL, @username ou username do Instagram")) -> dict:
-    return _stories_payload(profile)
+    return _snapshot_payload(_source_for_username(profile))
 
 
 @app.get("/stories/{username}")
 def stories_path(username: str) -> dict:
-    return _stories_payload(username)
-
-
-@app.get("/media/{story_id}")
-def story_media(story_id: str) -> Response:
-    media_url = resolve_media(story_id)
-    if not media_url:
-        raise HTTPException(status_code=404, detail="Mídia do Story não encontrada ou expirada.")
-
-    cached_content = resolve_media_content(story_id)
-    if cached_content:
-        content, media_type = cached_content
-        return Response(
-            content=content,
-            media_type=media_type,
-            headers={"Cache-Control": "private, max-age=60"},
-        )
-
-    request = UrlRequest(
-        media_url,
-        headers={
-            "Referer": "https://www.instagram.com/",
-            "User-Agent": "Mozilla/5.0",
-        },
-    )
-    try:
-        with urlopen(request, timeout=30) as upstream:
-            content = upstream.read()
-            media_type = upstream.headers.get_content_type() or "application/octet-stream"
-    except (HTTPError, URLError, TimeoutError) as exc:
-        raise HTTPException(status_code=502, detail="Não foi possível carregar a mídia do Story.") from exc
-
-    return Response(
-        content=content,
-        media_type=media_type,
-        headers={"Cache-Control": "private, max-age=60"},
-    )
-
-
-def _rss_response(profile: str) -> Response:
-    username, stories = _fetch_stories(profile)
-    xml = build_story_rss(username, stories)
-    return Response(content=xml, media_type="application/rss+xml; charset=utf-8")
+    return _snapshot_payload(_source_for_username(username))
 
 
 @app.get("/rss/stories")
 def rss_query(profile: str = Query(..., description="URL, @username ou username do Instagram")) -> Response:
-    return _rss_response(profile)
+    source = _source_for_username(profile)
+    return source_rss(source["source_id"])
 
 
 @app.get("/rss/stories/{username}")
 def rss_path(username: str) -> Response:
-    return _rss_response(username)
+    source = _source_for_username(username)
+    return source_rss(source["source_id"])
+
+
+@app.get("/media/{source_id}/{filename}")
+def persisted_media(source_id: str, filename: str) -> FileResponse:
+    try:
+        path = source_store.media_path(source_id, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Mídia não encontrada")
+
+    media_type, _ = mimetypes.guess_type(path.name)
+    return FileResponse(
+        path,
+        media_type=media_type or "application/octet-stream",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )

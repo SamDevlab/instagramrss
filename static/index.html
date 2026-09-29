@@ -277,12 +277,12 @@
 <body>
   <main class="page">
     <section class="hero">
-      <h1>Veja os Stories pelo @</h1>
-      <p class="subtitle">Digite o usuário do Instagram. Os Stories ativos aparecem no quadrado abaixo e avançam automaticamente.</p>
+      <h1>Processe um Story do Instagram</h1>
+      <p class="subtitle">Cole o link de um Story. A conexão autorizada será usada somente pela source criada para ele.</p>
 
       <form id="searchForm" class="search">
-        <input id="profileInput" autocomplete="off" spellcheck="false" placeholder="@usuario ou instagram.com/usuario" aria-label="Usuário do Instagram">
-        <button id="searchButton" type="submit">Buscar Stories</button>
+        <input id="profileInput" autocomplete="off" spellcheck="false" placeholder="https://www.instagram.com/stories/usuario/ID/" aria-label="Link de um Story do Instagram">
+        <button id="searchButton" type="submit">Processar</button>
       </form>
     </section>
 
@@ -299,7 +299,7 @@
         <div>
           <div class="spinner"></div>
           <div class="state-title">Buscando Stories…</div>
-          <div class="state-copy">Consultando o Instagram pela sessão configurada no servidor.</div>
+          <div class="state-copy">Validando o permalink e carregando a conexão autorizada da source.</div>
         </div>
       </div>
 
@@ -468,18 +468,36 @@
       showOnly(loadingState);
 
       try {
-        const response = await fetch(`/stories?profile=${encodeURIComponent(profile)}`, {
-          headers: { 'Accept': 'application/json' }
+        const response = await fetch('/sources', {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ story_url: profile, refresh: true })
         });
 
         const payload = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(payload.detail || `Erro ${response.status}`);
+        if (!response.ok) {
+          const detail = payload.detail;
+          const code = detail?.code;
+          if (code === 'AUTH_CONNECTION_REQUIRED') {
+            throw new Error('Nenhuma conexão Instagram ativa. Autorize uma conexão antes de processar este Story.');
+          }
+          if (code === 'RECONNECT_REQUIRED' || code === 'REVOKED') {
+            throw new Error('A conexão desta source precisa ser reconectada antes de um novo processamento.');
+          }
+          throw new Error(detail?.message || detail || `Erro ${response.status}`);
+        }
 
-        stories = Array.isArray(payload.stories) ? payload.stories : [];
+        const storiesResponse = await fetch(`/sources/${encodeURIComponent(payload.source_id)}/stories`, {
+          headers: { 'Accept': 'application/json' }
+        });
+        const storiesPayload = await storiesResponse.json().catch(() => ({}));
+        if (!storiesResponse.ok) throw new Error(storiesPayload.detail || `Erro ${storiesResponse.status}`);
+
+        stories = Array.isArray(storiesPayload.stories) ? storiesPayload.stories : [];
         currentIndex = 0;
 
         if (!stories.length) {
-          errorTitle.textContent = `@${payload.username || profile} está sem Stories ativos`;
+          errorTitle.textContent = `@${storiesPayload.username || profile} está sem Stories ativos`;
           errorText.textContent = 'Nenhum Story disponível neste momento. Tente novamente mais tarde.';
           showOnly(errorState);
           return;
@@ -494,7 +512,7 @@
         showOnly(errorState);
       } finally {
         button.disabled = false;
-        button.textContent = 'Buscar Stories';
+        button.textContent = 'Processar';
       }
     }
 

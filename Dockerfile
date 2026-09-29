@@ -9,7 +9,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN mkdir -p /app/session
+RUN mkdir -p /app/session /app/data
+
+VOLUME ["/app/session", "/app/data"]
 
 EXPOSE 8000
 

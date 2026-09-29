@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree as ET
 
 from instagram.models import StoryMedia
-from rss.builder import MEDIA_NS, build_story_rss
+from rss.builder import MEDIA_NS, build_source_rss, build_story_rss
 
 
 def test_build_story_rss_contains_media_content():
@@ -27,3 +27,25 @@ def test_build_story_rss_contains_media_content():
     assert media is not None
     assert media.attrib["url"] == "https://example.com/story.jpg"
     assert media.attrib["type"] == "image/jpeg"
+
+
+def test_build_source_rss_uses_local_media_url():
+    source = {"source_id": "ig_abc", "username": "nasa"}
+    snapshot = {
+        "items": [
+            {
+                "provider_story_id": "123",
+                "provider_index": 0,
+                "taken_at": "2026-09-16T20:00:00+00:00",
+                "expires_at": "2026-09-17T20:00:00+00:00",
+                "media_type": "video",
+                "filename": "abc.mp4",
+                "content_type": "video/mp4",
+            }
+        ]
+    }
+    xml = build_source_rss(source, snapshot, public_base_url="https://rss.example")
+    root = ET.fromstring(xml)
+    media = root.find(f"./channel/item/{{{MEDIA_NS}}}content")
+    assert media is not None
+    assert media.attrib["url"] == "https://rss.example/media/ig_abc/abc.mp4"
