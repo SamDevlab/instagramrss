@@ -1,34 +1,35 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Callable
 
+from instagram.auth.service import AuthConnectionError, AuthConnectionService
 from instagram.downloader import MediaDownloadError, MediaDownloader
 from instagram.parser import parse_story_permalink
 from instagram.providers import (
     DirectInstagramProvider,
     MobileInstagramProvider,
     ProviderError,
+    ProviderErrorCode,
     ResolvedUser,
     StoryProvider,
 )
+from instagram.providers.factory import ProviderFactory
 from instagram.storage import SourceStore, utcnow_iso
 
 
 class SourceServiceError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        self.code = code
+        super().__init__(message)
 
 
-def default_provider_factory() -> StoryProvider:
-    provider_name = os.getenv("INSTAGRAM_PROVIDER", "mobile").strip().lower() or "mobile"
-    if provider_name == "mobile":
-        return MobileInstagramProvider()
-    if provider_name == "direct":
-        return DirectInstagramProvider()
-    raise SourceServiceError(f"INSTAGRAM_PROVIDER inválido: {provider_name}")
+def default_provider_factory(source: dict | None = None) -> StoryProvider:
+    return ProviderFactory().for_source(source or {})
 
 
 def _snapshot_id(items: list[dict]) -> str:
@@ -43,11 +44,14 @@ class SourceService:
     def __init__(
         self,
         store: SourceStore | None = None,
-        provider_factory: Callable[[], StoryProvider] | None = None,
+        provider_factory: Callable[..., StoryProvider] | None = None,
         downloader: MediaDownloader | None = None,
+        auth_service: AuthConnectionService | None = None,
     ) -> None:
         self.store = store or SourceStore()
-        self.provider_factory = provider_factory or default_provider_factory
+        self.auth_service = auth_service or AuthConnectionService()
+        self.provider_factory = provider_factory
+        self.provider_registry = ProviderFactory(self.auth_service)
         self.downloader = downloader or MediaDownloader()
         self._locks: dict[str, Lock] = {}
         self._locks_guard = Lock()
@@ -56,7 +60,52 @@ class SourceService:
         with self._locks_guard:
             return self._locks.setdefault(source_id, Lock())
 
-    def create_source(self, story_url: str, refresh: bool = False) -> dict:
+    def _provider_for_source(self, source: dict) -> StoryProvider:
+        if self.provider_factory is None:
+            selected = self.auth_service.select_for_source(source)
+            if (
+                source.get("_new_source")
+                and not source.get("auth_connection_id")
+                and selected.type != "LEGACY_SERVER_SESSION"
+            ):
+                source["auth_connection_id"] = selected.id
+            return self.provider_registry.for_source(source)
+
+        try:
+            parameters = inspect.signature(self.provider_factory).parameters.values()
+            accepts_source = any(
+                parameter.kind in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                }
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_source = False
+        return self.provider_factory(source) if accepts_source else self.provider_factory()
+
+    def _record_provider_auth_failure(self, source: dict, error: ProviderError) -> str:
+        if (
+            source.get("auth_connection_id")
+            and error.code
+            in {
+                ProviderErrorCode.LOGIN_REQUIRED,
+                ProviderErrorCode.CHALLENGE_REQUIRED,
+                ProviderErrorCode.CHECKPOINT_REQUIRED,
+                ProviderErrorCode.INVALID_SESSION,
+            }
+        ):
+            self.auth_service.mark_reconnect_required(source["auth_connection_id"], error.code.value)
+            return "RECONNECT_REQUIRED"
+        return error.code.value
+
+    def create_source(
+        self,
+        story_url: str,
+        refresh: bool = False,
+        auth_connection_id: str | None = None,
+    ) -> dict:
         parsed = parse_story_permalink(story_url)
         existing = self.store.find_source_by_username(parsed.username)
         if existing:
@@ -64,29 +113,42 @@ class SourceService:
             source["seed_story_id"] = parsed.seed_story_id
             source["canonical_permalink"] = parsed.canonical_permalink
             source["updated_at"] = utcnow_iso()
+            if auth_connection_id:
+                source["auth_connection_id"] = auth_connection_id
         else:
             source_id = self.store.source_id_for(parsed.username)
             source = {
                 "source_id": source_id,
                 "username": parsed.username,
                 "instagram_user_id": None,
+                "auth_connection_id": auth_connection_id,
                 "seed_story_id": parsed.seed_story_id,
                 "canonical_permalink": parsed.canonical_permalink,
                 "created_at": utcnow_iso(),
                 "updated_at": utcnow_iso(),
+                "_new_source": True,
             }
 
-        provider = self.provider_factory()
-        if source.get("instagram_user_id"):
-            resolved = ResolvedUser(
-                user_id=str(source["instagram_user_id"]),
-                username=str(source["username"]).lower(),
-            )
-        else:
-            resolved = provider.resolve_source(parsed.username, parsed.seed_story_id)
+        try:
+            provider = self._provider_for_source(source)
+        except ProviderError as exc:
+            status = self._record_provider_auth_failure(source, exc)
+            raise SourceServiceError(str(exc), code=status) from exc
+        try:
+            if source.get("instagram_user_id"):
+                resolved = ResolvedUser(
+                    user_id=str(source["instagram_user_id"]),
+                    username=str(source["username"]).lower(),
+                )
+            else:
+                resolved = provider.resolve_source(parsed.username, parsed.seed_story_id)
+        except ProviderError as exc:
+            status = self._record_provider_auth_failure(source, exc)
+            raise SourceServiceError(str(exc), code=status) from exc
         source["username"] = resolved.username
         source["instagram_user_id"] = resolved.user_id
         source["updated_at"] = utcnow_iso()
+        source.pop("_new_source", None)
         self.store.save_source(source)
         if refresh:
             self.refresh_source(source["source_id"])
@@ -137,17 +199,39 @@ class SourceService:
         self.store.save_state(source_id, state)
 
         try:
-            provider = self.provider_factory()
+            provider = self._provider_for_source(source)
             stories = provider.list_stories(source["instagram_user_id"], source["username"])
-        except ProviderError as exc:
+            if source.get("auth_connection_id"):
+                self.auth_service.mark_validated(source["auth_connection_id"])
+        except AuthConnectionError as exc:
             state.update(
                 {
-                    "lastStatus": exc.code.value,
+                    "lastStatus": exc.code,
                     "consecutiveFailures": int(state.get("consecutiveFailures", 0)) + 1,
                 }
             )
             self.store.save_state(source_id, state)
-            return {"source_id": source_id, "status": exc.code.value, "changed": False, "error": str(exc)}
+            return {
+                "source_id": source_id,
+                "status": exc.code,
+                "changed": False,
+                "error": str(exc),
+            }
+        except ProviderError as exc:
+            status = self._record_provider_auth_failure(source, exc)
+            state.update(
+                {
+                    "lastStatus": status,
+                    "consecutiveFailures": int(state.get("consecutiveFailures", 0)) + 1,
+                }
+            )
+            self.store.save_state(source_id, state)
+            error = (
+                "A conexão Instagram precisa ser reconectada."
+                if status == "RECONNECT_REQUIRED"
+                else str(exc)
+            )
+            return {"source_id": source_id, "status": status, "changed": False, "error": error}
 
         discovered = len(stories)
         if previous_ids and discovered == 0:

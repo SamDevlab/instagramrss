@@ -23,9 +23,9 @@ def _utc(value: datetime) -> datetime:
 class DirectInstagramProvider(StoryProvider):
     """Story provider backed by the persistent Instaloader session."""
 
-    def __init__(self) -> None:
+    def __init__(self, credential: dict | None = None) -> None:
         try:
-            self.loader = create_loader()
+            self.loader = create_loader(credential=credential)
         except InstagramSessionError as exc:
             raise ProviderError(ProviderErrorCode.INVALID_SESSION, str(exc)) from exc
 

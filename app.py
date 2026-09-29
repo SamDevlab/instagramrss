@@ -7,9 +7,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
+from instagram.auth.service import AuthConnectionError, AuthConnectionService
 from instagram.parser import normalize_username
 from instagram.scheduler import StoryScheduler
-from instagram.service import SourceService
+from instagram.service import SourceService, SourceServiceError
 from instagram.storage import SourceStore
 from rss.builder import build_source_rss
 
@@ -18,7 +19,8 @@ BASE_DIR = Path(__file__).resolve().parent
 VIEWER_FILE = BASE_DIR / "static" / "index.html"
 
 source_store = SourceStore()
-source_service = SourceService(store=source_store)
+auth_connection_service = AuthConnectionService()
+source_service = SourceService(store=source_store, auth_service=auth_connection_service)
 story_scheduler = StoryScheduler(source_service)
 
 
@@ -52,6 +54,7 @@ app = FastAPI(
 class SourceCreateRequest(BaseModel):
     story_url: str
     refresh: bool = False
+    auth_connection_id: str | None = None
 
 
 @app.get("/", include_in_schema=False)
@@ -113,11 +116,51 @@ def _snapshot_payload(source: dict) -> dict:
 @app.post("/sources")
 def create_source(payload: SourceCreateRequest) -> dict:
     try:
-        return source_service.create_source(payload.story_url, refresh=payload.refresh)
+        return source_service.create_source(
+            payload.story_url,
+            refresh=payload.refresh,
+            auth_connection_id=payload.auth_connection_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except AuthConnectionError as exc:
+        raise HTTPException(
+            status_code=409 if exc.code in {"AUTH_CONNECTION_REQUIRED", "RECONNECT_REQUIRED", "REVOKED"} else 503,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except SourceServiceError as exc:
+        if exc.code == "RECONNECT_REQUIRED":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": "A conexão precisa ser reconectada."},
+            ) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/auth-connections")
+def list_auth_connections() -> dict:
+    return {
+        "count": len(auth_connection_service.list_public()),
+        "connections": auth_connection_service.list_public(),
+    }
+
+
+@app.get("/auth-connections/{connection_id}")
+def get_auth_connection(connection_id: str) -> dict:
+    try:
+        return auth_connection_service.get(connection_id).public_dict()
+    except AuthConnectionError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.delete("/auth-connections/{connection_id}")
+def disconnect_auth_connection(connection_id: str) -> dict:
+    try:
+        return auth_connection_service.disconnect(connection_id).public_dict()
+    except AuthConnectionError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)}) from exc
 
 
 @app.get("/sources")

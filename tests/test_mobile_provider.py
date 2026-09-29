@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import sys
 from types import SimpleNamespace
 
 from instagram.providers.mobile import MobileInstagramProvider
@@ -70,3 +71,22 @@ def test_mobile_story_feed_normalizes_video_and_image_candidates():
     assert stories[0].video_url.endswith("video.mp4")
     assert stories[1].media_type == "image"
     assert stories[1].image_url.endswith("image.jpg")
+
+
+def test_mobile_provider_uses_injected_connection_credential(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def login_by_sessionid(self, sessionid):
+            calls.append(sessionid)
+            return True
+
+    monkeypatch.setitem(sys.modules, "instagrapi", SimpleNamespace(Client=FakeClient))
+    monkeypatch.setattr(
+        "instagram.providers.mobile.create_loader",
+        lambda: (_ for _ in ()).throw(AssertionError("global loader must not be used")),
+    )
+
+    MobileInstagramProvider(credential={"sessionid": "connection-secret"})
+
+    assert calls == ["connection-secret"]

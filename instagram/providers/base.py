@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
+from instagram.auth.crypto import redact_sensitive_message
+
 
 class ProviderErrorCode(str, Enum):
     RATE_LIMITED = "RATE_LIMITED"
@@ -13,12 +15,13 @@ class ProviderErrorCode(str, Enum):
     CHECKPOINT_REQUIRED = "CHECKPOINT_REQUIRED"
     FEEDBACK_REQUIRED = "FEEDBACK_REQUIRED"
     INVALID_SESSION = "INVALID_SESSION"
+    AUTH_CONNECTION_CAPABILITY_MISMATCH = "AUTH_CONNECTION_CAPABILITY_MISMATCH"
     PROVIDER_ERROR = "PROVIDER_ERROR"
 
 
 class ProviderError(RuntimeError):
     def __init__(self, code: ProviderErrorCode, message: str) -> None:
-        super().__init__(message)
+        super().__init__(redact_sensitive_message(message))
         self.code = code
 
 

@@ -7,11 +7,15 @@ Microserviço FastAPI para cadastrar contas a partir do link de um Story ativo, 
 ```text
 permalink de Story
       ↓
-username
+source
       ↓
-Instagram user_id
+auth_connection_id
       ↓
-DirectInstagramProvider (sessão persistente)
+AuthConnectionService
+      ↓
+ProviderFactory
+      ↓
+MobileInstagramProvider
       ↓
 Stories ativas + IDs reais
       ↓
@@ -22,7 +26,7 @@ snapshot persistente
 JSON / Media RSS / Viewer
 ```
 
-O SaveClip não faz parte do provider de produção. A ferramenta `saveclip_protocol_probe.py`, quando usada, serve somente para observação sanitizada durante a comparação de comportamento.
+O pipeline de coleta, download, SHA-256, snapshot, catálogo, state, RSS e scheduler continua sendo único. O SaveClip não faz parte do provider de produção.
 
 ## Cadastro
 
@@ -34,12 +38,22 @@ https://www.instagram.com/stories/usuario/123456789/
 
 O permalink serve para onboarding. Depois que o serviço resolve o `instagram_user_id`, os refreshes usam o ID persistido.
 
-Criar uma fonte:
+Criar uma source a partir de um link de Story:
 
 ```bash
 curl -X POST http://localhost:8000/sources \
   -H "Content-Type: application/json" \
   -d '{"story_url":"https://www.instagram.com/stories/nasa/123456789/","refresh":true}'
+```
+
+Quando houver mais de uma conexão ativa, informe explicitamente o vínculo:
+
+```json
+{
+  "story_url": "https://www.instagram.com/stories/nasa/123456789/",
+  "auth_connection_id": "auth_xxx",
+  "refresh": true
+}
 ```
 
 ## Endpoints
@@ -54,6 +68,9 @@ curl -X POST http://localhost:8000/sources \
 - `GET /sources/{source_id}/stories`
 - `GET /sources/{source_id}/rss.xml`
 - `GET /media/{source_id}/{filename}`
+- `GET /auth-connections`
+- `GET /auth-connections/{id}`
+- `DELETE /auth-connections/{id}`
 
 Aliases antigos continuam disponíveis para fontes já cadastradas:
 
@@ -79,21 +96,46 @@ data/
       media/
         {sha256}.jpg
         {sha256}.mp4
+  auth/
+    connections.json
+    credentials.json  # ciphertext AES-GCM; nunca contém plaintext
 ```
 
 `provider_story_id` é a identidade lógica. SHA-256 é a identidade física do arquivo.
 
+`source.json` guarda os metadados da source e somente a referência `auth_connection_id` para a credencial. Session IDs, cookies e tokens ficam no credential store separado e criptografado.
+
 Em falhas, o último snapshot `COMPLETE` é preservado. Um retorno vazio após um snapshot não vazio vira `SUSPICIOUS_EMPTY_SNAPSHOT`. Quedas maiores que 50% exigem confirmação em um segundo ciclo equivalente.
 
-## Sessão do Instagram
+## Conexões Instagram
 
-Copie `.env.example` para `.env`.
+Copie `.env.example` para `.env`. Para persistir uma conexão `INSTAGRAM_SESSION`, configure uma chave AES em base64 ou hexadecimal:
 
 ```env
-INSTAGRAM_USERNAME=sua_conta_de_consulta
-INSTAGRAM_PASSWORD=
+AUTH_CREDENTIAL_MASTER_KEY=gere_uma_chave_de_32_bytes_em_base64
+```
+
+O serviço não aceita sessionid ou cookies pela API. O bootstrap inicial é uma operação explícita na máquina autorizada:
+
+```powershell
+python scripts/create_instagram_session.py --browser chrome
+python scripts/authorize_instagram_connection.py \
+  --username sua_conta_autorizada \
+  --session-file .\session\instagram.session
+```
+
+O segundo comando grava a sessão no credential store criptografado e imprime somente os metadados públicos da conexão. Gere a chave, por exemplo, com:
+
+```powershell
+python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+```
+
+Uma source nova usa a única conexão ativa quando não recebe `auth_connection_id`. Com múltiplas conexões, o ID deve ser enviado no cadastro. Sources antigas sem `auth_connection_id` continuam usando temporariamente o fallback legado:
+
+```env
+INSTAGRAM_USERNAME=conta_legada_do_servidor
 INSTAGRAM_SESSION_FILE=./session/instagram.session
-INSTAGRAM_PROVIDER=direct
+INSTAGRAM_PROVIDER=mobile
 
 DATA_DIR=./data
 PUBLIC_BASE_URL=http://localhost:8000
@@ -102,7 +144,7 @@ STORY_STALE_MINUTES=35
 STORY_SCHEDULER_ENABLED=true
 ```
 
-Para criar a sessão inicial, use temporariamente a senha e execute:
+Para criar a sessão legada inicial, use temporariamente a senha e execute:
 
 ```powershell
 python scripts/create_instagram_session.py
@@ -116,7 +158,18 @@ python scripts/create_instagram_session.py --browser chrome
 
 Nunca versione senha, sessão, cookies ou dados do diretório `data/`.
 
-## Provider direto
+### Estados de conexão
+
+- `ACTIVE`: pode ser usada pelo provider selecionado para a source.
+- `RECONNECT_REQUIRED`: o Instagram rejeitou a sessão ou exigiu login/challenge/checkpoint. A coleta é interrompida até nova autorização.
+- `REVOKED`: a conexão foi desconectada por `DELETE /auth-connections/{id}`.
+- `ERROR`: ocorreu uma falha persistente no credential store.
+
+Desconectar uma conexão revoga e remove a credencial criptografada, mas preserva sources, `instagram_user_id`, catálogo, mídia e RSS histórico.
+
+Para reconectar, autorize uma nova conexão com o script e envie o novo `auth_connection_id` no `POST /sources` usando um permalink da mesma source. O user ID já persistido será reaproveitado e o pipeline não repetirá `story_info`.
+
+## Provider mobile
 
 O provider padrão usa o Instaloader já presente no projeto:
 
@@ -127,7 +180,9 @@ O provider padrão usa o Instaloader já presente no projeto:
 5. a URL temporária é usada somente durante o download;
 6. RSS/JSON de produção usam URLs locais.
 
-Erros de rate limit, login, challenge, checkpoint e sessão inválida são convertidos em estados explícitos e não substituem o último snapshot válido.
+O `MobileInstagramProvider` recebe uma credencial já resolvida pelo `ProviderFactory`; ele não acessa `auth_connections.json` nem conhece o credential store. Cada refresh cria um contexto de cliente separado para a conexão da source.
+
+Erros de rate limit, login, challenge, checkpoint e sessão inválida são convertidos em estados explícitos. Falhas de autenticação marcam a conexão como `RECONNECT_REQUIRED` e não substituem o último snapshot válido.
 
 ## Scheduler
 
@@ -141,6 +196,12 @@ STORY_REFRESH_MINUTES=15
 o processo percorre as fontes cadastradas. Há lock por fonte para impedir refresh simultâneo da mesma conta.
 
 `STORY_STALE_MINUTES` define quando uma fonte sem novo `COMPLETE` passa a `STALE`, sem apagar o snapshot.
+
+Durante cada ciclo, o scheduler resolve `auth_connection_id` individualmente. A falha de `auth_A` não impede o refresh de uma source vinculada a `auth_B`.
+
+## Meta OAuth
+
+`META_OAUTH` está reservado no contrato de autenticação e é rejeitado explicitamente pelo factory enquanto não houver adapter Graph API neste projeto. Ele não é tratado como substituto universal do provider mobile: suas capabilities devem limitar a coleta às contas profissionais autorizadas.
 
 ## Rodando localmente
 
@@ -185,7 +246,8 @@ docker run --rm -p 8000:8000 --env-file .env \
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest -q
-python -m compileall .
+python -m compileall -q .
+pip check
 ```
 
 Os testes automatizados usam providers/downloaders falsos e não dependem de Instagram, SaveClip, Chrome ou internet.

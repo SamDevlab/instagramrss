@@ -11,6 +11,7 @@ from instagram.providers.base import (
     StoryProvider,
 )
 from instagram.session import InstagramSessionError, create_loader
+from instagram.auth.crypto import redact_sensitive_message
 
 
 def _utc(value: datetime) -> datetime:
@@ -48,7 +49,7 @@ def _error_code(exc: BaseException) -> ProviderErrorCode:
 class MobileInstagramProvider(StoryProvider):
     """Story provider backed by Instagrapi's mobile Story endpoints."""
 
-    def __init__(self, client: Any | None = None) -> None:
+    def __init__(self, client: Any | None = None, credential: dict[str, Any] | None = None) -> None:
         if client is not None:
             self.client = client
             return
@@ -56,9 +57,12 @@ class MobileInstagramProvider(StoryProvider):
         try:
             from instagrapi import Client
 
-            loader = create_loader()
-            cookies = loader.context.save_session()
-            sessionid = cookies.get("sessionid")
+            if credential is None:
+                loader = create_loader()
+                cookies = loader.context.save_session()
+            else:
+                cookies = credential.get("cookies") or {}
+            sessionid = credential.get("sessionid") if credential else cookies.get("sessionid")
             if not sessionid:
                 raise InstagramSessionError("A sessão não contém sessionid válido.")
             self.client = Client()
@@ -70,7 +74,8 @@ class MobileInstagramProvider(StoryProvider):
             raise ProviderError(ProviderErrorCode.INVALID_SESSION, str(exc)) from exc
         except Exception as exc:
             code = _error_code(exc)
-            raise ProviderError(code, f"Falha ao inicializar provider mobile: {exc}") from exc
+            safe = redact_sensitive_message(str(exc), (str(sessionid),) if "sessionid" in locals() and sessionid else ())
+            raise ProviderError(code, f"Falha ao inicializar provider mobile: {safe}") from exc
 
     def resolve_source(self, username: str, seed_story_id: str | None = None) -> ResolvedUser:
         if not seed_story_id:
