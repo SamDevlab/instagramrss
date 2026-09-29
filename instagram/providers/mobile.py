@@ -31,6 +31,12 @@ def _attr(value: Any, *names: str, default: Any = None) -> Any:
 def _error_code(exc: BaseException) -> ProviderErrorCode:
     name = exc.__class__.__name__.lower()
     message = str(exc).lower()
+    if "private" in message or "not authorized to view" in message or "access denied" in message:
+        return ProviderErrorCode.TARGET_ACCESS_DENIED
+    if "not found" in message or "does not exist" in message:
+        return ProviderErrorCode.TARGET_NOT_FOUND
+    if "auth_invalid" in message or "authorization required" in message:
+        return ProviderErrorCode.AUTH_INVALID
     if "429" in message or "toomanyrequests" in name or "rate limit" in message:
         return ProviderErrorCode.RATE_LIMITED
     if "feedback" in message:

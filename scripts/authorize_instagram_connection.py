@@ -27,6 +27,17 @@ def main() -> int:
     )
     parser.add_argument("--username", required=True, help="Usuário dono da sessão local.")
     parser.add_argument(
+        "--owner-id",
+        default=None,
+        help="Tenant/owner do instagramrss no fluxo administrativo; não é autenticação de aplicação.",
+    )
+    parser.add_argument(
+        "--scope",
+        choices=("private", "shared"),
+        default="private",
+        help="PRIVATE por padrão; SHARED somente quando escolhido explicitamente.",
+    )
+    parser.add_argument(
         "--session-file",
         default=os.getenv("INSTAGRAM_SESSION_FILE", "./session/instagram.session"),
         help="Arquivo de sessão local a importar.",
@@ -37,7 +48,12 @@ def main() -> int:
         session_file = PROJECT_ROOT / session_file
 
     try:
-        connection = AuthConnectionService().create_from_session_file(args.username, session_file)
+        connection = AuthConnectionService().create_from_session_file(
+            args.username,
+            session_file,
+            owner_id=args.owner_id,
+            scope=args.scope.upper(),
+        )
     except AuthConnectionError as exc:
         print(f"Erro: {exc}")
         return 1

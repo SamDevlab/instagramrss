@@ -11,10 +11,14 @@ import app as app_module
 
 from instagram.auth.crypto import CredentialStoreError, EncryptedCredentialStore
 from instagram.auth.models import (
+    AuthCapability,
     AuthConnection,
+    AuthConnectionScope,
     AuthConnectionStatus,
     AuthConnectionType,
+    AuthPolicy,
 )
+from instagram.auth.resolver import AuthResolver
 from instagram.auth.service import AuthConnectionError, AuthConnectionService
 from instagram.auth.store import AuthConnectionStore
 from instagram.providers.base import ProviderError, ProviderErrorCode, ProviderStory, ResolvedUser, StoryProvider
@@ -28,6 +32,11 @@ from rss.builder import build_source_rss
 MASTER_KEY = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode()
 
 
+@pytest.fixture(autouse=True)
+def disable_implicit_legacy(monkeypatch):
+    monkeypatch.setenv("INSTAGRAM_LEGACY_SESSION_ENABLED", "false")
+
+
 def make_auth_service(tmp_path: Path) -> AuthConnectionService:
     return AuthConnectionService(
         store=AuthConnectionStore(tmp_path / "connections.json"),
@@ -38,10 +47,19 @@ def make_auth_service(tmp_path: Path) -> AuthConnectionService:
     )
 
 
-def make_connection(auth_service: AuthConnectionService, username: str, secret: str):
+def make_connection(
+    auth_service: AuthConnectionService,
+    username: str,
+    secret: str,
+    *,
+    owner_id: str | None = None,
+    scope: str = "PRIVATE",
+):
     return auth_service.create_instagram_session_connection(
         username,
         {"sessionid": secret, "cookies": {"sessionid": secret}},
+        owner_id=owner_id,
+        scope=scope,
     )
 
 
@@ -245,6 +263,7 @@ def test_disconnect_revokes_credential_but_keeps_source_history(tmp_path):
 def test_legacy_source_without_auth_connection_keeps_working(tmp_path, monkeypatch):
     monkeypatch.setenv("INSTAGRAM_USERNAME", "legacy-owner")
     monkeypatch.setenv("INSTAGRAM_SESSION_FILE", "./session/legacy.session")
+    monkeypatch.setenv("INSTAGRAM_LEGACY_SESSION_ENABLED", "true")
     auth_service = make_auth_service(tmp_path)
     legacy_provider = CredentialBoundProvider("legacy", "legacy-secret")
     monkeypatch.setattr(ProviderFactory, "_legacy_provider", staticmethod(lambda: legacy_provider))
@@ -265,18 +284,350 @@ def test_new_source_binds_the_only_active_connection(tmp_path, monkeypatch):
     monkeypatch.delenv("INSTAGRAM_USERNAME", raising=False)
     monkeypatch.delenv("INSTAGRAM_SESSION_FILE", raising=False)
     auth_service = make_auth_service(tmp_path)
-    connection = make_connection(auth_service, "clienta", "secret-a")
+    connection = auth_service.create_instagram_session_connection(
+        "clienta",
+        {"sessionid": "secret-a", "cookies": {"sessionid": "secret-a"}},
+        owner_id="client_A",
+    )
     provider = CredentialBoundProvider(connection.id, "secret-a")
-    monkeypatch.setattr(ProviderFactory, "for_source", lambda self, source: provider)
+    monkeypatch.setattr(ProviderFactory, "for_connection", lambda self, selected: provider)
     source_service = SourceService(
         store=SourceStore(tmp_path / "data"),
         auth_service=auth_service,
         downloader=FakeDownloader(),
     )
 
-    source = source_service.create_source("https://www.instagram.com/stories/target/111/")
+    source = source_service.create_source(
+        "https://www.instagram.com/stories/target/111/",
+        owner_id="client_A",
+    )
 
-    assert source["auth_connection_id"] == connection.id
+    assert source["auth_connection_id"] is None
+    assert source["last_auth_connection_id"] == connection.id
+
+
+def test_connection_scope_defaults_private_and_shared_requires_explicit_choice(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    private = make_connection(auth_service, "private", "secret-private", owner_id="client_A")
+    shared = make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+
+    assert private.owner_id == "client_A"
+    assert private.scope == AuthConnectionScope.PRIVATE.value
+    assert shared.scope == AuthConnectionScope.SHARED.value
+    assert auth_service.get(private.id).scope == AuthConnectionScope.PRIVATE.value
+
+
+def test_owner_private_is_preferred_over_shared(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    own = make_connection(auth_service, "own", "secret-own", owner_id="client_A")
+    make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+
+    resolution = AuthResolver(auth_service).resolve_with_reason(
+        {"owner_id": "client_A", "auth_policy": AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value}
+    )
+
+    assert resolution.connection.id == own.id
+    assert resolution.reason == "OWNER_AUTH"
+
+
+def test_private_of_other_owner_is_never_auto_selected(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    make_connection(auth_service, "other", "secret-other", owner_id="client_B")
+
+    with pytest.raises(AuthConnectionError) as error:
+        AuthResolver(auth_service).resolve(
+            {"owner_id": "client_A", "auth_policy": AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value}
+        )
+
+    assert error.value.code == "AUTH_CONNECTION_REQUIRED"
+
+
+def test_explicit_private_of_other_owner_is_forbidden(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    other = make_connection(auth_service, "other", "secret-other", owner_id="client_B")
+
+    with pytest.raises(AuthConnectionError) as error:
+        AuthResolver(auth_service).resolve(
+            {
+                "owner_id": "client_A",
+                "auth_policy": AuthPolicy.PINNED.value,
+                "auth_connection_id": other.id,
+            }
+        )
+
+    assert error.value.code == "AUTH_CONNECTION_FORBIDDEN"
+
+
+def test_client_without_own_auth_uses_shared_connection(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    shared = make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+
+    resolution = AuthResolver(auth_service).resolve_with_reason(
+        {"owner_id": "client_B", "auth_policy": AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value}
+    )
+
+    assert resolution.connection.id == shared.id
+    assert resolution.reason == "SHARED_FALLBACK"
+
+
+def test_new_owner_auth_takes_over_from_previous_shared_fallback(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    shared = make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    source = {"owner_id": "client_A", "auth_policy": AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value}
+    first = AuthResolver(auth_service).resolve_with_reason(source)
+    own = make_connection(auth_service, "own", "secret-own", owner_id="client_A")
+    second = AuthResolver(auth_service).resolve_with_reason(source)
+
+    assert first.connection.id == shared.id
+    assert second.connection.id == own.id
+    assert second.reason == "OWNER_AUTH"
+
+
+def test_reconnect_required_owner_falls_back_to_shared_on_next_cycle(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    own = make_connection(auth_service, "own", "secret-own", owner_id="client_A")
+    shared = make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    auth_service.mark_reconnect_required(own.id, "AUTH_INVALID")
+
+    resolution = AuthResolver(auth_service).resolve_with_reason(
+        {"owner_id": "client_A", "auth_policy": AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value}
+    )
+
+    assert resolution.connection.id == shared.id
+    assert auth_service.get(own.id).status == AuthConnectionStatus.RECONNECT_REQUIRED.value
+
+
+def test_automatic_auth_failure_marks_selected_connection_and_falls_back_next_cycle(tmp_path, monkeypatch):
+    auth_service = make_auth_service(tmp_path)
+    own = make_connection(auth_service, "own", "secret-own", owner_id="client_A")
+    shared = make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    providers = {
+        own.id: CredentialBoundProvider(own.id, "secret-own"),
+        shared.id: CredentialBoundProvider(shared.id, "secret-shared"),
+    }
+    monkeypatch.setattr(ProviderFactory, "for_connection", lambda self, selected: providers[selected.id])
+    source_service = SourceService(
+        store=SourceStore(tmp_path / "data"),
+        auth_service=auth_service,
+        downloader=FakeDownloader(),
+    )
+    source = source_service.create_source(
+        "https://www.instagram.com/stories/target/111/",
+        owner_id="client_A",
+    )
+    providers[own.id].fail = ProviderError(ProviderErrorCode.AUTH_INVALID, "auth_invalid")
+
+    failed = source_service.refresh_source(source["source_id"])
+    recovered = source_service.refresh_source(source["source_id"])
+
+    assert failed["status"] == "RECONNECT_REQUIRED"
+    assert auth_service.get(own.id).status == AuthConnectionStatus.RECONNECT_REQUIRED.value
+    assert recovered["status"] == "COMPLETE"
+    assert auth_service.get(shared.id).last_validated_at is not None
+    stored = source_service.store.load_source(source["source_id"])
+    assert stored["last_auth_connection_id"] == shared.id
+    assert stored["last_auth_selection_reason"] == "SHARED_FALLBACK"
+
+
+def test_pinned_connection_never_falls_back(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    own = make_connection(auth_service, "own", "secret-own", owner_id="client_A")
+    make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    auth_service.mark_reconnect_required(own.id, "AUTH_INVALID")
+
+    with pytest.raises(AuthConnectionError) as error:
+        AuthResolver(auth_service).resolve(
+            {
+                "owner_id": "client_A",
+                "auth_policy": AuthPolicy.PINNED.value,
+                "auth_connection_id": own.id,
+            }
+        )
+
+    assert error.value.code == AuthConnectionStatus.RECONNECT_REQUIRED.value
+
+
+def test_multiple_owner_connections_are_ranked_deterministically(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    first = make_connection(auth_service, "first", "secret-first", owner_id="client_A")
+    second = make_connection(auth_service, "second", "secret-second", owner_id="client_A")
+    first.last_validated_at = "2026-09-29T10:00:00+00:00"
+    second.last_validated_at = "2026-09-29T11:00:00+00:00"
+    auth_service.store.save(first)
+    auth_service.store.save(second)
+
+    resolution = AuthResolver(auth_service).resolve({"owner_id": "client_A"})
+
+    assert resolution.id == second.id
+
+
+def test_multiple_shared_connections_use_stable_id_tiebreaker(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    first = make_connection(
+        auth_service,
+        "first",
+        "secret-first",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    second = make_connection(
+        auth_service,
+        "second",
+        "secret-second",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    for connection in (first, second):
+        connection.last_validated_at = "2026-09-29T11:00:00+00:00"
+        connection.updated_at = "2026-09-29T11:00:00+00:00"
+        auth_service.store.save(connection)
+
+    expected = min(first.id, second.id)
+    assert AuthResolver(auth_service).resolve({"owner_id": "client_A"}).id == expected
+
+
+def test_incompatible_or_revoked_connections_are_not_selected(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    incompatible = make_connection(
+        auth_service,
+        "incompatible",
+        "secret-incompatible",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    incompatible.capabilities = [AuthCapability.FETCH_MEDIA.value]
+    auth_service.store.save(incompatible)
+    revoked = make_connection(
+        auth_service,
+        "revoked",
+        "secret-revoked",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    revoked.status = AuthConnectionStatus.REVOKED.value
+    auth_service.store.save(revoked)
+    failed = make_connection(
+        auth_service,
+        "failed",
+        "secret-failed",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    failed.status = AuthConnectionStatus.ERROR.value
+    auth_service.store.save(failed)
+
+    with pytest.raises(AuthConnectionError) as error:
+        AuthResolver(auth_service).resolve({"owner_id": "client_A"})
+
+    assert error.value.code == "AUTH_CONNECTION_REQUIRED"
+
+
+def test_target_access_denied_keeps_auth_active(tmp_path):
+    auth_service = make_auth_service(tmp_path)
+    shared = make_connection(
+        auth_service,
+        "shared",
+        "secret-shared",
+        owner_id="operator",
+        scope=AuthConnectionScope.SHARED.value,
+    )
+    factory = RecordingFactory(auth_service)
+    source_service = SourceService(
+        store=SourceStore(tmp_path / "data"),
+        auth_service=auth_service,
+        provider_factory=factory.for_source,
+        downloader=FakeDownloader(),
+    )
+    source = source_service.create_source(
+        "https://www.instagram.com/stories/target/111/",
+        owner_id="client_A",
+    )
+    factory.providers[shared.id].fail = ProviderError(
+        ProviderErrorCode.TARGET_ACCESS_DENIED,
+        "target is private",
+    )
+
+    result = source_service.refresh_source(source["source_id"])
+
+    assert result["status"] == ProviderErrorCode.TARGET_ACCESS_DENIED.value
+    assert auth_service.get(shared.id).status == AuthConnectionStatus.ACTIVE.value
+
+
+def test_legacy_is_last_resort_after_owner_and_shared(tmp_path, monkeypatch):
+    monkeypatch.setenv("INSTAGRAM_USERNAME", "legacy-owner")
+    monkeypatch.setenv("INSTAGRAM_SESSION_FILE", "./session/legacy.session")
+    monkeypatch.setenv("INSTAGRAM_LEGACY_SESSION_ENABLED", "true")
+    auth_service = make_auth_service(tmp_path)
+    own = make_connection(auth_service, "own", "secret-own", owner_id="client_A")
+
+    resolution = AuthResolver(auth_service).resolve_with_reason({"owner_id": "client_A"})
+
+    assert resolution.connection.id == own.id
+    assert resolution.reason == "OWNER_AUTH"
+
+    auth_service.mark_reconnect_required(own.id, "AUTH_INVALID")
+    legacy_resolution = AuthResolver(auth_service).resolve_with_reason({"owner_id": "client_A"})
+    assert legacy_resolution.connection.id == "legacy_server_session"
+    assert legacy_resolution.reason == "LEGACY_FALLBACK"
+
+
+def test_old_auth_connection_migrates_to_private_without_owner(tmp_path):
+    path = tmp_path / "connections.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"version": 1, "connections": {"auth_old": '
+        '{"id": "auth_old", "type": "INSTAGRAM_SESSION", '
+        '"status": "ACTIVE", "credential_ref": "cred_old", '
+        '"capabilities": ["list_target_user_stories"]}}}',
+        encoding="utf-8",
+    )
+
+    migrated = AuthConnectionStore(path).get("auth_old")
+
+    assert migrated.owner_id is None
+    assert migrated.scope == AuthConnectionScope.PRIVATE.value
 
 
 def test_refresh_does_not_resolve_seed_again(tmp_path):
@@ -317,7 +668,11 @@ def test_meta_connection_is_rejected_by_capability_contract(tmp_path):
 
     with pytest.raises(AuthConnectionError) as error:
         ProviderFactory(auth_service).for_source(
-            {"auth_connection_id": connection.id, "username": "target"}
+            {
+                "auth_connection_id": connection.id,
+                "auth_policy": "PINNED",
+                "username": "target",
+            }
         )
 
     assert error.value.code == "AUTH_CONNECTION_CAPABILITY_MISMATCH"

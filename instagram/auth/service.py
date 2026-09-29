@@ -12,6 +12,7 @@ from instagram.auth.crypto import (
 from instagram.auth.models import (
     INSTAGRAM_SESSION_CAPABILITIES,
     AuthConnection,
+    AuthConnectionScope,
     AuthConnectionStatus,
     AuthConnectionType,
 )
@@ -51,8 +52,12 @@ class AuthConnectionService:
         credential: Mapping[str, Any],
         *,
         subject_user_id: str | None = None,
+        owner_id: str | None = None,
+        scope: str = AuthConnectionScope.PRIVATE.value,
     ) -> AuthConnection:
         username = normalize_username(subject_username)
+        owner = self.normalize_owner_id(owner_id)
+        normalized_scope = self._normalize_scope(scope)
         cookies = credential.get("cookies")
         sessionid = credential.get("sessionid")
         if not isinstance(cookies, Mapping):
@@ -82,6 +87,8 @@ class AuthConnectionService:
             type=AuthConnectionType.INSTAGRAM_SESSION.value,
             status=AuthConnectionStatus.ACTIVE.value,
             credential_ref=credential_ref,
+            owner_id=owner,
+            scope=normalized_scope,
             capabilities=list(INSTAGRAM_SESSION_CAPABILITIES),
             subject_username=username,
             subject_user_id=str(subject_user_id) if subject_user_id else None,
@@ -100,6 +107,9 @@ class AuthConnectionService:
         self,
         subject_username: str,
         session_file: str | Path,
+        *,
+        owner_id: str | None = None,
+        scope: str = AuthConnectionScope.PRIVATE.value,
     ) -> AuthConnection:
         try:
             credential = load_session_credential(subject_username, session_file)
@@ -108,7 +118,34 @@ class AuthConnectionService:
                 "AUTH_CREDENTIAL_INVALID",
                 f"Não foi possível importar a sessão local: {exc}",
             ) from exc
-        return self.create_instagram_session_connection(subject_username, credential)
+        return self.create_instagram_session_connection(
+            subject_username,
+            credential,
+            owner_id=owner_id,
+            scope=scope,
+        )
+
+    @staticmethod
+    def normalize_owner_id(owner_id: str | None) -> str | None:
+        value = str(owner_id or "").strip()
+        if not value:
+            return None
+        if len(value) > 128 or any(character.isspace() for character in value):
+            raise AuthConnectionError(
+                "OWNER_ID_INVALID",
+                "owner_id deve ser um identificador não vazio de até 128 caracteres.",
+            )
+        return value
+
+    @staticmethod
+    def _normalize_scope(scope: str | None) -> str:
+        value = str(scope or AuthConnectionScope.PRIVATE.value).strip().upper()
+        if value not in {item.value for item in AuthConnectionScope}:
+            raise AuthConnectionError(
+                "AUTH_CONNECTION_SCOPE_INVALID",
+                "scope deve ser PRIVATE ou SHARED.",
+            )
+        return value
 
     def credential_for(self, connection: AuthConnection) -> dict[str, Any]:
         if connection.type != AuthConnectionType.INSTAGRAM_SESSION.value:
@@ -128,64 +165,37 @@ class AuthConnectionService:
         except CredentialStoreError as exc:
             raise AuthConnectionError("AUTH_CREDENTIAL_UNAVAILABLE", str(exc), connection=connection) from exc
 
-    def connection_for_source(self, source: Mapping[str, Any]) -> AuthConnection:
-        connection_id = str(source.get("auth_connection_id") or "").strip()
-        if connection_id:
-            connection = self.get(connection_id)
-            if connection.status != AuthConnectionStatus.ACTIVE.value:
-                raise AuthConnectionError(
-                    connection.status,
-                    f"A conexão de autenticação está em estado {connection.status}.",
-                    connection=connection,
-                )
-            return connection
-
-        active = [
-            connection
-            for connection in self.store.list()
-            if connection.status == AuthConnectionStatus.ACTIVE.value
-        ]
+    def legacy_connection(self) -> AuthConnection | None:
         legacy_username = os.getenv("INSTAGRAM_USERNAME", "").strip()
         legacy_file = os.getenv("INSTAGRAM_SESSION_FILE", "./session/instagram.session").strip()
-
-        def legacy_connection() -> AuthConnection:
-            now = self.store.now()
-            return AuthConnection(
-                id="legacy_server_session",
-                type=AuthConnectionType.LEGACY_SERVER_SESSION.value,
-                status=AuthConnectionStatus.ACTIVE.value,
-                credential_ref=None,
-                capabilities=list(INSTAGRAM_SESSION_CAPABILITIES),
-                subject_username=legacy_username,
-                created_at=now,
-                updated_at=now,
-                last_validated_at=None,
-            )
-
-        # A new source prefers an explicitly provisioned connection even when
-        # the legacy environment is still configured. Existing sources with a
-        # persisted user id retain the legacy behavior during migration unless
-        # they are explicitly rebound.
-        if not source.get("_new_source") and legacy_username and legacy_file:
-            return legacy_connection()
-        if active and len(active) == 1:
-            return active[0]
-        if source.get("_new_source") and legacy_username and legacy_file and not active:
-            return legacy_connection()
-        raise AuthConnectionError(
-            "AUTH_CONNECTION_REQUIRED",
-            "A source sem auth_connection_id exige uma conexão ativa explícita.",
+        enabled = os.getenv("INSTAGRAM_LEGACY_SESSION_ENABLED", "true").strip().lower()
+        if not legacy_username or not legacy_file or enabled not in {"1", "true", "yes", "on"}:
+            return None
+        now = self.store.now()
+        return AuthConnection(
+            id="legacy_server_session",
+            type=AuthConnectionType.LEGACY_SERVER_SESSION.value,
+            status=AuthConnectionStatus.ACTIVE.value,
+            credential_ref=None,
+            owner_id=os.getenv("INSTAGRAM_LEGACY_OWNER_ID", "legacy_operator").strip() or "legacy_operator",
+            scope=AuthConnectionScope.SHARED.value,
+            capabilities=list(INSTAGRAM_SESSION_CAPABILITIES),
+            subject_username=legacy_username,
+            created_at=now,
+            updated_at=now,
+            last_validated_at=None,
         )
 
+    def connection_for_source(self, source: Mapping[str, Any]) -> AuthConnection:
+        """Compatibility shim; selection rules live in AuthResolver."""
+        from instagram.auth.resolver import AuthResolver
+
+        return AuthResolver(self).resolve(source)
+
     def select_for_source(self, source: Mapping[str, Any], required_capability: str | None = None) -> AuthConnection:
-        connection = self.connection_for_source(source)
-        if required_capability and required_capability not in connection.capabilities:
-            raise AuthConnectionError(
-                "AUTH_CONNECTION_CAPABILITY_MISMATCH",
-                f"A conexão não suporta a capability {required_capability}.",
-                connection=connection,
-            )
-        return connection
+        from instagram.auth.resolver import AuthResolver
+
+        return AuthResolver(self).resolve(source, required_capability)
 
     def mark_reconnect_required(self, connection_id: str, error: str) -> AuthConnection:
         connection = self.get(connection_id)

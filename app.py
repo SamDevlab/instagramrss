@@ -55,6 +55,8 @@ class SourceCreateRequest(BaseModel):
     story_url: str
     refresh: bool = False
     auth_connection_id: str | None = None
+    owner_id: str | None = None
+    auth_policy: str | None = None
 
 
 @app.get("/", include_in_schema=False)
@@ -120,19 +122,40 @@ def create_source(payload: SourceCreateRequest) -> dict:
             payload.story_url,
             refresh=payload.refresh,
             auth_connection_id=payload.auth_connection_id,
+            owner_id=payload.owner_id,
+            auth_policy=payload.auth_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except AuthConnectionError as exc:
+        if exc.code in {"OWNER_ID_INVALID", "AUTH_CONNECTION_SCOPE_INVALID"}:
+            status_code = 400
+        elif exc.code in {
+            "AUTH_CONNECTION_REQUIRED",
+            "AUTH_CONNECTION_FORBIDDEN",
+            "AUTH_CONNECTION_CAPABILITY_MISMATCH",
+            "AUTH_POLICY_INVALID",
+            "RECONNECT_REQUIRED",
+            "REVOKED",
+        }:
+            status_code = 409
+        else:
+            status_code = 503
         raise HTTPException(
-            status_code=409 if exc.code in {"AUTH_CONNECTION_REQUIRED", "RECONNECT_REQUIRED", "REVOKED"} else 503,
+            status_code=status_code,
             detail={"code": exc.code, "message": str(exc)},
         ) from exc
     except SourceServiceError as exc:
-        if exc.code == "RECONNECT_REQUIRED":
+        if exc.code in {
+            "AUTH_CONNECTION_REQUIRED",
+            "AUTH_CONNECTION_FORBIDDEN",
+            "AUTH_POLICY_INVALID",
+            "RECONNECT_REQUIRED",
+            "REVOKED",
+        }:
             raise HTTPException(
                 status_code=409,
-                detail={"code": exc.code, "message": "A conexão precisa ser reconectada."},
+                detail={"code": exc.code, "message": str(exc)},
             ) from exc
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:

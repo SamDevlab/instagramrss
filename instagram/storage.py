@@ -74,11 +74,35 @@ class SourceStore:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 
+    @staticmethod
+    def _normalize_source(source: dict) -> dict:
+        """Apply conservative defaults to sources written before auth policies."""
+        normalized = dict(source)
+        owner_id = normalized.get("owner_id")
+        normalized["owner_id"] = (
+            str(owner_id).strip() or None
+            if owner_id is not None
+            else None
+        )
+        if "auth_policy" not in normalized:
+            normalized["auth_policy"] = (
+                "PINNED"
+                if normalized.get("auth_connection_id")
+                else "PREFER_OWNER_WITH_SHARED_FALLBACK"
+            )
+        elif normalized.get("auth_policy"):
+            normalized["auth_policy"] = str(normalized["auth_policy"]).strip().upper()
+        normalized.setdefault("last_auth_connection_id", None)
+        normalized.setdefault("last_auth_selection_reason", None)
+        return normalized
+
     def list_sources(self) -> list[dict]:
         items: list[dict] = []
         for source_file in sorted(self.sources_dir.glob("*/source.json")):
             try:
-                items.append(self._read_json(source_file, {}))
+                source = self._read_json(source_file, {})
+                if isinstance(source, dict):
+                    items.append(self._normalize_source(source))
             except (OSError, json.JSONDecodeError):
                 continue
         return items
@@ -94,13 +118,13 @@ class SourceStore:
         paths = self.paths(source["source_id"])
         paths.media.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            _atomic_json(paths.source, source)
+            _atomic_json(paths.source, self._normalize_source(source))
 
     def load_source(self, source_id: str) -> dict:
         source = self._read_json(self.paths(source_id).source, None)
         if not source:
             raise FileNotFoundError(f"Fonte {source_id} não encontrada")
-        return source
+        return self._normalize_source(source)
 
     def load_state(self, source_id: str) -> dict:
         return self._read_json(

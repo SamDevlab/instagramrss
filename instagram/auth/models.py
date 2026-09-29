@@ -18,6 +18,16 @@ class AuthConnectionStatus(str, Enum):
     ERROR = "ERROR"
 
 
+class AuthConnectionScope(str, Enum):
+    PRIVATE = "PRIVATE"
+    SHARED = "SHARED"
+
+
+class AuthPolicy(str, Enum):
+    PREFER_OWNER_WITH_SHARED_FALLBACK = "PREFER_OWNER_WITH_SHARED_FALLBACK"
+    PINNED = "PINNED"
+
+
 class AuthCapability(str, Enum):
     RESOLVE_OWNER_FROM_SEED = "resolve_owner_from_seed"
     LIST_TARGET_USER_STORIES = "list_target_user_stories"
@@ -38,6 +48,8 @@ class AuthConnection:
     type: str
     status: str
     credential_ref: str | None
+    owner_id: str | None = None
+    scope: str = AuthConnectionScope.PRIVATE.value
     capabilities: list[str] = field(default_factory=list)
     subject_username: str | None = None
     subject_user_id: str | None = None
@@ -53,6 +65,8 @@ class AuthConnection:
             "type": self.type,
             "status": self.status,
             "credential_ref": self.credential_ref,
+            "owner_id": self.owner_id,
+            "scope": self.scope,
             "capabilities": list(self.capabilities),
             "subject_username": self.subject_username,
             "subject_user_id": self.subject_user_id,
@@ -74,6 +88,10 @@ class AuthConnection:
                 if payload.get("credential_ref")
                 else None
             ),
+            owner_id=str(payload["owner_id"]) if payload.get("owner_id") else None,
+            # Historical connections were never safe to lend automatically.
+            # Missing scope therefore migrates conservatively to PRIVATE.
+            scope=str(payload.get("scope") or AuthConnectionScope.PRIVATE.value).strip().upper(),
             capabilities=[str(item) for item in payload.get("capabilities", [])],
             subject_username=(
                 str(payload["subject_username"])

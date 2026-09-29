@@ -95,7 +95,13 @@ class DirectInstagramProvider(StoryProvider):
         message = str(exc)
         lowered = message.lower()
 
-        if "toomanyrequests" in name or "429" in lowered or "rate limit" in lowered:
+        if "private" in lowered or "not authorized to view" in lowered or "access denied" in lowered:
+            code = ProviderErrorCode.TARGET_ACCESS_DENIED
+        elif "not found" in lowered or "does not exist" in lowered:
+            code = ProviderErrorCode.TARGET_NOT_FOUND
+        elif "auth_invalid" in lowered or "authorization required" in lowered:
+            code = ProviderErrorCode.AUTH_INVALID
+        elif "toomanyrequests" in name or "429" in lowered or "rate limit" in lowered:
             code = ProviderErrorCode.RATE_LIMITED
         elif "feedback" in lowered:
             code = ProviderErrorCode.FEEDBACK_REQUIRED

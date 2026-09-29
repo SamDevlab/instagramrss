@@ -7,12 +7,12 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Callable
 
+from instagram.auth.models import AuthCapability, AuthPolicy
+from instagram.auth.resolver import AuthResolver
 from instagram.auth.service import AuthConnectionError, AuthConnectionService
 from instagram.downloader import MediaDownloadError, MediaDownloader
 from instagram.parser import parse_story_permalink
 from instagram.providers import (
-    DirectInstagramProvider,
-    MobileInstagramProvider,
     ProviderError,
     ProviderErrorCode,
     ResolvedUser,
@@ -50,6 +50,7 @@ class SourceService:
     ) -> None:
         self.store = store or SourceStore()
         self.auth_service = auth_service or AuthConnectionService()
+        self.auth_resolver = AuthResolver(self.auth_service)
         self.provider_factory = provider_factory
         self.provider_registry = ProviderFactory(self.auth_service)
         self.downloader = downloader or MediaDownloader()
@@ -62,14 +63,14 @@ class SourceService:
 
     def _provider_for_source(self, source: dict) -> StoryProvider:
         if self.provider_factory is None:
-            selected = self.auth_service.select_for_source(source)
-            if (
-                source.get("_new_source")
-                and not source.get("auth_connection_id")
-                and selected.type != "LEGACY_SERVER_SESSION"
-            ):
-                source["auth_connection_id"] = selected.id
-            return self.provider_registry.for_source(source)
+            resolution = self.auth_resolver.resolve_with_reason(
+                source,
+                AuthCapability.LIST_TARGET_USER_STORIES.value,
+            )
+            source["last_auth_connection_id"] = resolution.connection.id
+            source["last_auth_selection_reason"] = resolution.reason
+            self.store.save_source(source)
+            return self.provider_registry.for_connection(resolution.connection)
 
         try:
             parameters = inspect.signature(self.provider_factory).parameters.values()
@@ -85,18 +86,31 @@ class SourceService:
             accepts_source = False
         return self.provider_factory(source) if accepts_source else self.provider_factory()
 
-    def _record_provider_auth_failure(self, source: dict, error: ProviderError) -> str:
-        if (
+    @staticmethod
+    def _selected_auth_connection_id(source: dict) -> str | None:
+        policy = str(source.get("auth_policy") or "").strip().upper()
+        connection_id = (
             source.get("auth_connection_id")
+            if policy == AuthPolicy.PINNED.value
+            else source.get("last_auth_connection_id") or source.get("auth_connection_id")
+        )
+        return str(connection_id).strip() if connection_id else None
+
+    def _record_provider_auth_failure(self, source: dict, error: ProviderError) -> str:
+        connection_id = self._selected_auth_connection_id(source)
+        if (
+            connection_id
+            and connection_id != "legacy_server_session"
             and error.code
             in {
                 ProviderErrorCode.LOGIN_REQUIRED,
                 ProviderErrorCode.CHALLENGE_REQUIRED,
                 ProviderErrorCode.CHECKPOINT_REQUIRED,
                 ProviderErrorCode.INVALID_SESSION,
+                ProviderErrorCode.AUTH_INVALID,
             }
         ):
-            self.auth_service.mark_reconnect_required(source["auth_connection_id"], error.code.value)
+            self.auth_service.mark_reconnect_required(connection_id, error.code.value)
             return "RECONNECT_REQUIRED"
         return error.code.value
 
@@ -105,6 +119,8 @@ class SourceService:
         story_url: str,
         refresh: bool = False,
         auth_connection_id: str | None = None,
+        owner_id: str | None = None,
+        auth_policy: str | None = None,
     ) -> dict:
         parsed = parse_story_permalink(story_url)
         existing = self.store.find_source_by_username(parsed.username)
@@ -113,21 +129,48 @@ class SourceService:
             source["seed_story_id"] = parsed.seed_story_id
             source["canonical_permalink"] = parsed.canonical_permalink
             source["updated_at"] = utcnow_iso()
-            if auth_connection_id:
-                source["auth_connection_id"] = auth_connection_id
+            if owner_id is not None:
+                source["owner_id"] = self.auth_service.normalize_owner_id(owner_id)
         else:
             source_id = self.store.source_id_for(parsed.username)
             source = {
                 "source_id": source_id,
                 "username": parsed.username,
                 "instagram_user_id": None,
-                "auth_connection_id": auth_connection_id,
+                "owner_id": self.auth_service.normalize_owner_id(owner_id),
+                "auth_connection_id": None,
+                "auth_policy": AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value,
+                "last_auth_connection_id": None,
+                "last_auth_selection_reason": None,
                 "seed_story_id": parsed.seed_story_id,
                 "canonical_permalink": parsed.canonical_permalink,
                 "created_at": utcnow_iso(),
                 "updated_at": utcnow_iso(),
-                "_new_source": True,
             }
+
+        if auth_policy is not None:
+            normalized_policy = str(auth_policy).strip().upper()
+            if normalized_policy not in {item.value for item in AuthPolicy}:
+                raise SourceServiceError(
+                    "A source deve usar PREFER_OWNER_WITH_SHARED_FALLBACK ou PINNED.",
+                    code="AUTH_POLICY_INVALID",
+                )
+            source["auth_policy"] = normalized_policy
+            if normalized_policy == AuthPolicy.PREFER_OWNER_WITH_SHARED_FALLBACK.value:
+                source["auth_connection_id"] = None
+        if auth_connection_id:
+            if auth_policy and str(auth_policy).strip().upper() != AuthPolicy.PINNED.value:
+                raise SourceServiceError(
+                    "auth_connection_id explícito exige auth_policy=PINNED.",
+                    code="AUTH_POLICY_INVALID",
+                )
+            source["auth_connection_id"] = auth_connection_id
+            source["auth_policy"] = AuthPolicy.PINNED.value
+        if source.get("auth_policy") == AuthPolicy.PINNED.value and not source.get("auth_connection_id"):
+            raise SourceServiceError(
+                "Uma source PINNED exige auth_connection_id.",
+                code="AUTH_CONNECTION_REQUIRED",
+            )
 
         try:
             provider = self._provider_for_source(source)
@@ -148,7 +191,6 @@ class SourceService:
         source["username"] = resolved.username
         source["instagram_user_id"] = resolved.user_id
         source["updated_at"] = utcnow_iso()
-        source.pop("_new_source", None)
         self.store.save_source(source)
         if refresh:
             self.refresh_source(source["source_id"])
@@ -201,8 +243,9 @@ class SourceService:
         try:
             provider = self._provider_for_source(source)
             stories = provider.list_stories(source["instagram_user_id"], source["username"])
-            if source.get("auth_connection_id"):
-                self.auth_service.mark_validated(source["auth_connection_id"])
+            selected_connection_id = self._selected_auth_connection_id(source)
+            if selected_connection_id and selected_connection_id != "legacy_server_session":
+                self.auth_service.mark_validated(selected_connection_id)
         except AuthConnectionError as exc:
             state.update(
                 {

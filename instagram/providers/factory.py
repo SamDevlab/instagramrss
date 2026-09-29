@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
+from instagram.auth.resolver import AuthResolver
 from instagram.auth.models import AuthConnectionType
 from instagram.auth.service import AuthConnectionError, AuthConnectionService
 from instagram.providers.base import StoryProvider
@@ -16,8 +17,7 @@ class ProviderFactory:
     def __init__(self, auth_service: AuthConnectionService | None = None) -> None:
         self.auth_service = auth_service or AuthConnectionService()
 
-    def for_source(self, source: Mapping[str, Any]) -> StoryProvider:
-        connection = self.auth_service.select_for_source(source)
+    def for_connection(self, connection) -> StoryProvider:
         if connection.type == AuthConnectionType.INSTAGRAM_SESSION.value:
             credential = self.auth_service.credential_for(connection)
             return MobileInstagramProvider(credential=credential)
@@ -37,6 +37,11 @@ class ProviderFactory:
             f"Tipo de conexão não suportado: {connection.type}.",
             connection=connection,
         )
+
+    def for_source(self, source: Mapping[str, Any]) -> StoryProvider:
+        """Compatibility entry point; AuthResolver remains the selector."""
+        resolution = AuthResolver(self.auth_service).resolve_with_reason(source)
+        return self.for_connection(resolution.connection)
 
     @staticmethod
     def _legacy_provider() -> StoryProvider:

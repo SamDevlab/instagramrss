@@ -9,9 +9,11 @@ permalink de Story
       ↓
 source
       ↓
-auth_connection_id
+owner_id + auth_policy
       ↓
 AuthConnectionService
+      ↓
+AuthResolver
       ↓
 ProviderFactory
       ↓
@@ -46,11 +48,23 @@ curl -X POST http://localhost:8000/sources \
   -d '{"story_url":"https://www.instagram.com/stories/nasa/123456789/","refresh":true}'
 ```
 
-Quando houver mais de uma conexão ativa, informe explicitamente o vínculo:
+Uma source nova usa `PREFER_OWNER_WITH_SHARED_FALLBACK`. O `owner_id` identifica o tenant/cliente no fluxo administrativo atual; ele não é autenticação da aplicação:
 
 ```json
 {
   "story_url": "https://www.instagram.com/stories/nasa/123456789/",
+  "owner_id": "client_A",
+  "refresh": true
+}
+```
+
+Para fixar explicitamente uma conexão, use `PINNED`:
+
+```json
+{
+  "story_url": "https://www.instagram.com/stories/nasa/123456789/",
+  "owner_id": "client_A",
+  "auth_policy": "PINNED",
   "auth_connection_id": "auth_xxx",
   "refresh": true
 }
@@ -103,7 +117,9 @@ data/
 
 `provider_story_id` é a identidade lógica. SHA-256 é a identidade física do arquivo.
 
-`source.json` guarda os metadados da source e somente a referência `auth_connection_id` para a credencial. Session IDs, cookies e tokens ficam no credential store separado e criptografado.
+`source.json` guarda os metadados da source, a política de seleção e, quando aplicável, a referência `auth_connection_id` de uma conexão PINNED. Session IDs, cookies e tokens ficam no credential store separado e criptografado.
+
+Os campos de seleção ficam separados: `auth_policy` define a política, `last_auth_connection_id` registra a conexão efetivamente escolhida no último ciclo e `last_auth_selection_reason` registra `OWNER_AUTH`, `SHARED_FALLBACK`, `PINNED` ou `LEGACY_FALLBACK`.
 
 Em falhas, o último snapshot `COMPLETE` é preservado. Um retorno vazio após um snapshot não vazio vira `SUSPICIOUS_EMPTY_SNAPSHOT`. Quedas maiores que 50% exigem confirmação em um segundo ciclo equivalente.
 
@@ -121,7 +137,19 @@ O serviço não aceita sessionid ou cookies pela API. O bootstrap inicial é uma
 python scripts/create_instagram_session.py --browser chrome
 python scripts/authorize_instagram_connection.py \
   --username sua_conta_autorizada \
-  --session-file .\session\instagram.session
+  --session-file .\session\instagram.session \
+  --owner-id client_A \
+  --scope private
+```
+
+Uma conexão operacional pode ser compartilhada somente por escolha explícita:
+
+```powershell
+python scripts/authorize_instagram_connection.py `
+  --username conta_operacional `
+  --session-file .\session\shared.session `
+  --owner-id operator `
+  --scope shared
 ```
 
 O segundo comando grava a sessão no credential store criptografado e imprime somente os metadados públicos da conexão. Gere a chave, por exemplo, com:
@@ -130,12 +158,14 @@ O segundo comando grava a sessão no credential store criptografado e imprime so
 python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
 ```
 
-Uma source nova usa a única conexão ativa quando não recebe `auth_connection_id`. Com múltiplas conexões, o ID deve ser enviado no cadastro. Sources antigas sem `auth_connection_id` continuam usando temporariamente o fallback legado:
+Sources novas usam `PREFER_OWNER_WITH_SHARED_FALLBACK`; `auth_connection_id` só é necessário para `PINNED`. Sources antigas sem política explícita recebem defaults conservadores durante a leitura e continuam podendo usar temporariamente o fallback legado:
 
 ```env
 INSTAGRAM_USERNAME=conta_legada_do_servidor
 INSTAGRAM_SESSION_FILE=./session/instagram.session
 INSTAGRAM_PROVIDER=mobile
+INSTAGRAM_LEGACY_SESSION_ENABLED=true
+INSTAGRAM_LEGACY_OWNER_ID=legacy_operator
 
 DATA_DIR=./data
 PUBLIC_BASE_URL=http://localhost:8000
@@ -167,7 +197,21 @@ Nunca versione senha, sessão, cookies ou dados do diretório `data/`.
 
 Desconectar uma conexão revoga e remove a credencial criptografada, mas preserva sources, `instagram_user_id`, catálogo, mídia e RSS histórico.
 
-Para reconectar, autorize uma nova conexão com o script e envie o novo `auth_connection_id` no `POST /sources` usando um permalink da mesma source. O user ID já persistido será reaproveitado e o pipeline não repetirá `story_info`.
+Para reconectar, autorize uma nova conexão com o script. Uma source `PINNED` recebe o novo `auth_connection_id` no `POST /sources`; uma source preferencial passa a encontrá-la automaticamente quando o `owner_id` e a capability forem compatíveis. O user ID já persistido será reaproveitado e o pipeline não repetirá `story_info`.
+
+### Políticas de seleção
+
+`PREFER_OWNER_WITH_SHARED_FALLBACK` resolve a conexão nesta ordem:
+
+1. conexões `ACTIVE` do próprio `owner_id` com a capability necessária;
+2. conexões `SHARED` `ACTIVE` compatíveis;
+3. sessão legada, se habilitada.
+
+Dentro de cada grupo, a seleção é determinística por `last_validated_at`, `updated_at` e `id`. Uma conexão `PRIVATE` de outro owner nunca entra no pool automático.
+
+`PINNED` respeita exatamente `auth_connection_id`. Se ela ficar inválida, a source retorna `RECONNECT_REQUIRED` ou o estado da conexão, preserva o snapshot e não muda silenciosamente para uma shared.
+
+O sistema ainda não possui login de usuários do próprio `instagramrss`; `owner_id` é uma identificação de tenant usada no bootstrap/admin. Um header arbitrário não é tratado como autenticação.
 
 ## Provider mobile
 
@@ -197,7 +241,9 @@ o processo percorre as fontes cadastradas. Há lock por fonte para impedir refre
 
 `STORY_STALE_MINUTES` define quando uma fonte sem novo `COMPLETE` passa a `STALE`, sem apagar o snapshot.
 
-Durante cada ciclo, o scheduler resolve `auth_connection_id` individualmente. A falha de `auth_A` não impede o refresh de uma source vinculada a `auth_B`.
+Durante cada ciclo, o scheduler resolve a conexão individualmente para cada source. A falha de `auth_A` não impede o refresh de uma source vinculada a `auth_B`.
+
+Em sources preferenciais, a conexão usada é reavaliada a cada ciclo. Se a conexão própria ficar `RECONNECT_REQUIRED`, o próximo ciclo pode usar uma `SHARED`; uma falha de acesso ao target mantém a conexão `ACTIVE`. Falhas de autenticação marcam somente a conexão que respondeu.
 
 ## Meta OAuth
 
